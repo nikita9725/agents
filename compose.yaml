@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.1-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: etl_agent
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - task_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U postgres -d etl_agent]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    image: "${COMPOSE_PROJECT_NAME:-etl-agent}-runtime"
+    build: .
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 40s
+    command: [python, -m, uvicorn, etl_agent.api:app, --host, 0.0.0.0, --port, "8000", --no-access-log, --workers, "1", --timeout-graceful-shutdown, "5"]
+    env_file: .env
+    environment:
+      TASK_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/etl_agent
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_EXTRA_BODY: ${LLM_EXTRA_BODY:-{}}
+    ports:
+      - "127.0.0.1:${AGENT_PORT:-8123}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 2s
+      timeout: 4s
+      retries: 30
+
+volumes:
+  task_data:

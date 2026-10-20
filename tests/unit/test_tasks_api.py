@@ -1,0 +1,297 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, create_autospec, patch
+from uuid import UUID, uuid4
+
+import httpx
+import pytest
+from dbos import DBOSClient, WorkflowSerializationFormat, WorkflowStatus
+from starlette.requests import Request
+
+from etl_agent.api import create_app, get_service
+from etl_agent.domain import AgentState, HistoryEntry, NextAction, RunInput
+from etl_agent.infrastructure.task_executor import DBOSTasks
+from etl_agent.runtime import RuntimeSettings
+from etl_agent.tasks import (
+    ExecutorUnavailable,
+    NodeName,
+    Task,
+    TaskError,
+    TaskNotFound,
+    TaskService,
+    TaskStatus,
+)
+
+pytestmark = pytest.mark.unit
+
+
+class FakeExecutor:
+    def __init__(self) -> None:
+        self.task_id = uuid4()
+        self.status: TaskStatus = "pending"
+        self.unavailable = False
+        self.transition = False
+        self._reads = 0
+        self.calls: list[str] = []
+
+    async def ready(self) -> None:
+        if self.unavailable:
+            raise ExecutorUnavailable
+
+    async def create(self, request: RunInput) -> Task:
+        await self.ready()
+        self.calls.append("create")
+        return Task(task_id=self.task_id, status="pending")
+
+    async def get(self, task_id: UUID) -> Task:
+        await self.ready()
+        self.calls.append("get")
+        if task_id != self.task_id:
+            raise TaskNotFound
+        self._reads += 1
+        if self.transition and self._reads > 1:
+            self.status = "success"
+        result = None
+        error = None
+        if self.status == "success":
+            result = AgentState(
+                goal="file missing",
+                current_step=1,
+                next_action=NextAction(action="Read logs", rationale="Need error"),
+                final_answer="Read logs",
+                history=[
+                    HistoryEntry(
+                        role="user" if node == "input" else "assistant", node=node, content="safe"
+                    )
+                    for node in ("input", "planning", "finalization")
+                ],
+            )
+        elif self.status in {"error", "timeout"}:
+            error = TaskError(
+                code="execution_failed" if self.status == "error" else "timeout",
+                message="Task failed",
+            )
+        return Task(task_id=task_id, status=self.status, result=result, error=error)
+
+    async def cancel(self, task_id: UUID) -> Task:
+        task = await self.get(task_id)
+        if task.status in {"pending", "running"}:
+            self.calls.append("cancel")
+            self.status = "interrupted"
+        return await self.get(task_id)
+
+    async def completed_nodes(self, task_id: UUID) -> list[NodeName]:
+        await self.ready()
+        return ["input", "planning", "finalization"] if self.status == "success" else []
+
+
+@asynccontextmanager
+async def client_for(executor: FakeExecutor) -> AsyncIterator[httpx.AsyncClient]:
+    app = create_app(TaskService(executor))
+    async with httpx.AsyncClient(
+        base_url="http://public", transport=httpx.ASGITransport(app=app)
+    ) as client:
+        yield client
+
+
+async def test_create_accepts_background_work_without_waiting() -> None:
+    executor = FakeExecutor()
+    async with client_for(executor) as client:
+        response = await client.post("/tasks", json={"goal": "file missing"})
+    assert response.status_code == 202
+    assert response.headers["Location"] == f"/tasks/{executor.task_id}"
+    assert response.json() == {
+        "task_id": str(executor.task_id),
+        "status": "pending",
+        "result": None,
+        "error": None,
+    }
+    assert executor.calls == ["create"]
+
+
+@pytest.mark.parametrize(
+    "status", ["pending", "running", "success", "error", "timeout", "interrupted"]
+)
+async def test_status_result_and_error_are_public_models(status: TaskStatus) -> None:
+    executor = FakeExecutor()
+    executor.status = status
+    async with client_for(executor) as client:
+        response = await client.get(f"/tasks/{executor.task_id}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == status
+    assert (body["result"] is not None) == (status == "success")
+    assert (body["error"] is not None) == (status in {"error", "timeout"})
+    assert "thread_id" not in response.text and "run_id" not in response.text
+
+
+async def test_unknown_task_and_bad_uuid() -> None:
+    executor = FakeExecutor()
+    async with client_for(executor) as client:
+        for suffix in ("", "/events", "/cancel"):
+            response = await client.request(
+                "POST" if suffix == "/cancel" else "GET", f"/tasks/{uuid4()}{suffix}"
+            )
+            assert response.status_code == 404
+        assert (await client.get("/tasks/not-a-uuid")).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "body", [{"goal": " "}, {"goal": "x", "max_steps": 0}, {"goal": "x", "thread_id": "secret"}]
+)
+async def test_invalid_input_never_reaches_executor(body: dict[str, str | int]) -> None:
+    executor = FakeExecutor()
+    async with client_for(executor) as client:
+        response = await client.post("/tasks", json=body)
+    assert response.status_code == 422 and "secret" not in response.text
+    assert not executor.calls
+
+
+@pytest.mark.parametrize(
+    "status", ["pending", "running", "success", "error", "timeout", "interrupted"]
+)
+async def test_cancellation_is_idempotent(status: TaskStatus) -> None:
+    executor = FakeExecutor()
+    executor.status = status
+    async with client_for(executor) as client:
+        first = await client.post(f"/tasks/{executor.task_id}/cancel")
+        second = await client.post(f"/tasks/{executor.task_id}/cancel")
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+    assert executor.calls.count("cancel") == (1 if status in {"pending", "running"} else 0)
+    assert "create" not in executor.calls
+
+
+async def test_sse_replays_progress_and_observes_completion() -> None:
+    executor = FakeExecutor()
+    executor.status = "running"
+    executor.transition = True
+    async with client_for(executor) as client:
+        response = await client.get(f"/tasks/{executor.task_id}/events")
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+    assert response.text.count("event: progress") == 3
+    assert '"status":"running"' in response.text and '"status":"success"' in response.text
+    assert "thread_id" not in response.text and "run_id" not in response.text
+    assert "create" not in executor.calls and "cancel" not in executor.calls
+
+
+async def test_closing_observer_does_not_cancel_execution() -> None:
+    executor = FakeExecutor()
+    service = TaskService(executor)
+    events = service.events(await service.get(executor.task_id))
+    assert (await anext(events)).event == "task"
+    await events.aclose()
+    assert "cancel" not in executor.calls
+
+
+async def test_public_schema_health_and_executor_errors() -> None:
+    executor = FakeExecutor()
+    async with client_for(executor) as client:
+        schema = (await client.get("/openapi.json")).json()
+        assert set(schema["paths"]) == {
+            "/ok",
+            "/ready",
+            "/tasks",
+            "/tasks/{task_id}",
+            "/tasks/{task_id}/cancel",
+            "/tasks/{task_id}/events",
+        }
+        for path in ("/threads", "/runs", "/assistants", "/store"):
+            assert (await client.get(path)).status_code == 404
+        executor.unavailable = True
+        assert (await client.get("/ok")).status_code == 200
+        assert (await client.get("/ready")).status_code == 503
+        assert (await client.post("/tasks", json={"goal": "file missing"})).status_code == 503
+
+
+async def test_applications_keep_services_isolated() -> None:
+    first, second = FakeExecutor(), FakeExecutor()
+    first.status, second.status = "running", "success"
+    async with client_for(first) as a, client_for(second) as b:
+        assert (await a.get(f"/tasks/{first.task_id}")).json()["status"] == "running"
+        assert (await b.get(f"/tasks/{second.task_id}")).json()["status"] == "success"
+        assert (await a.get(f"/tasks/{second.task_id}")).status_code == 404
+        assert (await b.get(f"/tasks/{first.task_id}")).status_code == 404
+
+
+@pytest.mark.parametrize("fail", [False, True])
+async def test_lifespan_closes_owned_client_and_clears_service(fail: bool) -> None:
+    client = create_autospec(DBOSClient, instance=True)
+    application = create_app()
+    request = Request({"type": "http", "app": application})
+    with pytest.raises(ExecutorUnavailable):
+        get_service(request)
+
+    @asynccontextmanager
+    async def runtime() -> AsyncIterator[TaskService]:
+        try:
+            yield TaskService(DBOSTasks(client, RuntimeSettings(_env_file=None)))
+        finally:
+            client.destroy()
+
+    with patch("etl_agent.api.task_runtime", runtime):
+        try:
+            async with application.router.lifespan_context(application):
+                await get_service(request).ready()
+                if fail:
+                    raise RuntimeError("lifespan body failed")
+        except RuntimeError as exc:
+            assert fail and str(exc) == "lifespan body failed"
+    client.destroy.assert_called_once()
+    with pytest.raises(ExecutorUnavailable):
+        get_service(request)
+
+
+async def test_lifespan_keeps_injected_service_with_owner() -> None:
+    service = TaskService(FakeExecutor())
+    application = create_app(service)
+    request = Request({"type": "http", "app": application})
+    with patch("etl_agent.api.task_runtime") as factory:
+        async with application.router.lifespan_context(application):
+            assert get_service(request) is service
+        factory.assert_not_called()
+    assert get_service(request) is service
+
+
+async def test_dbos_enqueue_is_durable_and_has_same_task_id() -> None:
+    client = create_autospec(DBOSClient, instance=True)
+    executor = DBOSTasks(client, RuntimeSettings(_env_file=None))
+    task = await executor.create(RunInput(goal="file missing"))
+    client.enqueue_async.assert_awaited_once()
+    options, task_id, goal, max_steps, correlation = client.enqueue_async.call_args.args
+    assert options["workflow_id"] == task_id == str(task.task_id)
+    assert options["workflow_name"] == "etl_task" and options["queue_name"] == "etl_tasks"
+    assert options["workflow_timeout"] == 180
+    assert options["serialization_type"] == WorkflowSerializationFormat.PORTABLE
+    assert (goal, max_steps) == ("file missing", 1)
+
+
+@pytest.mark.parametrize(
+    ("native", "expected"),
+    [
+        ("ENQUEUED", "pending"),
+        ("DELAYED", "pending"),
+        ("PENDING", "running"),
+        ("ERROR", "error"),
+        ("MAX_RECOVERY_ATTEMPTS_EXCEEDED", "error"),
+        ("CANCELLED", "interrupted"),
+    ],
+)
+async def test_dbos_status_mapping(native: str, expected: str) -> None:
+    client = create_autospec(DBOSClient, instance=True)
+    workflow = create_autospec(WorkflowStatus, instance=True)
+    workflow.status = native
+    workflow.workflow_deadline_epoch_ms = None
+    client.list_workflows_async.return_value = [workflow]
+    task = await DBOSTasks(client, RuntimeSettings(_env_file=None)).get(uuid4())
+    assert task.status == expected
+
+
+async def test_dbos_enqueue_failure_is_not_retried() -> None:
+    client = create_autospec(DBOSClient, instance=True)
+    client.enqueue_async = AsyncMock(side_effect=RuntimeError("database unavailable"))
+    with pytest.raises(ExecutorUnavailable):
+        await DBOSTasks(client, RuntimeSettings(_env_file=None)).create(
+            RunInput(goal="file missing")
+        )
+    client.enqueue_async.assert_awaited_once()

@@ -1,5 +1,3 @@
-from unittest.mock import patch
-
 import pytest
 from pydantic import SecretStr
 
@@ -17,10 +15,7 @@ def test_langsmith_is_not_required(key: str | None) -> None:
         llm_api_key=SecretStr("test-key"),
         langsmith_api_key=SecretStr(key) if key is not None else None,
     )
-    with (
-        patch("etl_agent.startup.Settings", return_value=settings),
-    ):
-        validate_startup()
+    validate_startup(settings)
 
 
 @pytest.mark.parametrize(
@@ -40,9 +35,8 @@ def test_provider_configuration(model: str, llm_key: str, error: str | None) -> 
         llm_api_key=SecretStr(llm_key),
         langsmith_api_key=SecretStr("unit-key"),
     )
-    with patch("etl_agent.startup.Settings", return_value=settings):
-        if error is None:
-            validate_startup()
-        else:
-            with pytest.raises(ValueError, match=error):
-                validate_startup()
+    if error is None:
+        validate_startup(settings)
+    else:
+        with pytest.raises(ValueError, match=error):
+            validate_startup(settings)

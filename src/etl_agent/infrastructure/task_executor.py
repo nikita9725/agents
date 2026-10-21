@@ -1,11 +1,12 @@
 """DBOS хранит очередь и статусы, LangGraph — checkpoints в PostgreSQL."""
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from typing import Protocol
 from uuid import UUID, uuid4
 
-from dbos import DBOSClient, EnqueueOptions, WorkflowSerializationFormat, WorkflowStatus
+from dbos import EnqueueOptions, WorkflowSerializationFormat
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
@@ -30,8 +31,47 @@ class Checkpoint(BaseModel):
     history: list[HistoryEntry] = Field(default_factory=list)
 
 
+class WorkflowRecord(Protocol):
+    @property
+    def status(self) -> str: ...
+
+    @property
+    def workflow_deadline_epoch_ms(self) -> int | None: ...
+
+    @property
+    def completed_at(self) -> int | None: ...
+
+    @property
+    def output(self) -> object: ...
+
+
+class WorkflowClient(Protocol):
+    async def enqueue_async(
+        self,
+        options: EnqueueOptions,
+        task_id: str,
+        goal: str,
+        max_steps: int,
+        correlation: str | None,
+    ) -> object: ...
+
+    async def list_workflows_async(
+        self,
+        *,
+        workflow_ids: list[str],
+        name: str,
+        load_input: bool,
+    ) -> Sequence[WorkflowRecord]: ...
+
+    async def cancel_workflow_async(self, workflow_id: str) -> None: ...
+
+    async def check_connection_async(self) -> None: ...
+
+    def destroy(self) -> None: ...
+
+
 class DBOSTasks:
-    def __init__(self, client: DBOSClient, settings: RuntimeSettings) -> None:
+    def __init__(self, client: WorkflowClient, settings: RuntimeSettings) -> None:
         self._client = client
         self._settings = settings
 
@@ -45,7 +85,7 @@ class DBOSTasks:
             logger.exception("event=executor.failed")
             raise ExecutorUnavailable from exc
 
-    async def _workflow(self, task_id: UUID) -> WorkflowStatus:
+    async def _workflow(self, task_id: UUID) -> WorkflowRecord:
         workflows = await self._client.list_workflows_async(
             workflow_ids=[str(task_id)],
             name=WORKFLOW_NAME,

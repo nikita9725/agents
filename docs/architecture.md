@@ -4,8 +4,8 @@
 - TaskService — типизированный асинхронный контракт приложения.
 - DBOSTasks — адаптер очереди и статусов DBOS, чтение checkpoints.
 - DBOS worker — постоянная очередь PostgreSQL, конкурентность и восстановление.
-- LangGraph — граф input → planning → finalization, native retry/timeout policies.
-- OpenAIPlanner — настоящий провайдер, structured output и классификация ошибок.
+- LangGraph — граф input → planning ⇄ tools → finalization, native retry/timeout policies.
+- OpenAIPlanner — настоящий провайдер, tool calling, structured finalization и классификация ошибок.
 
 ## Постоянное исполнение
 

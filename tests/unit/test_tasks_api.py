@@ -1,11 +1,10 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, create_autospec, patch
 from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from dbos import DBOSClient, WorkflowSerializationFormat, WorkflowStatus
+from dbos import WorkflowSerializationFormat
 from starlette.requests import Request
 
 from etl_agent.api import create_app, get_service
@@ -21,6 +20,7 @@ from etl_agent.tasks import (
     TaskService,
     TaskStatus,
 )
+from tests.fakes import FakeWorkflow, FakeWorkflowClient
 
 pytestmark = pytest.mark.unit
 
@@ -216,11 +216,7 @@ async def test_applications_keep_services_isolated() -> None:
 
 @pytest.mark.parametrize("fail", [False, True])
 async def test_lifespan_closes_owned_client_and_clears_service(fail: bool) -> None:
-    client = create_autospec(DBOSClient, instance=True)
-    application = create_app()
-    request = Request({"type": "http", "app": application})
-    with pytest.raises(ExecutorUnavailable):
-        get_service(request)
+    client = FakeWorkflowClient()
 
     @asynccontextmanager
     async def runtime() -> AsyncIterator[TaskService]:
@@ -229,41 +225,53 @@ async def test_lifespan_closes_owned_client_and_clears_service(fail: bool) -> No
         finally:
             client.destroy()
 
-    with patch("etl_agent.api.task_runtime", runtime):
-        try:
-            async with application.router.lifespan_context(application):
-                await get_service(request).ready()
-                if fail:
-                    raise RuntimeError("lifespan body failed")
-        except RuntimeError as exc:
-            assert fail and str(exc) == "lifespan body failed"
-    client.destroy.assert_called_once()
+    application = create_app(runtime_factory=runtime)
+    request = Request({"type": "http", "app": application})
+    with pytest.raises(ExecutorUnavailable):
+        get_service(request)
+    try:
+        async with application.router.lifespan_context(application):
+            await get_service(request).ready()
+            if fail:
+                raise RuntimeError("lifespan body failed")
+    except RuntimeError as exc:
+        assert fail and str(exc) == "lifespan body failed"
+    assert client.destroy_calls == 1 and client.ready_calls == 1
     with pytest.raises(ExecutorUnavailable):
         get_service(request)
 
 
 async def test_lifespan_keeps_injected_service_with_owner() -> None:
     service = TaskService(FakeExecutor())
-    application = create_app(service)
+    runtime_calls = 0
+
+    @asynccontextmanager
+    async def runtime() -> AsyncIterator[TaskService]:
+        nonlocal runtime_calls
+        runtime_calls += 1
+        yield service
+
+    application = create_app(service, runtime_factory=runtime)
     request = Request({"type": "http", "app": application})
-    with patch("etl_agent.api.task_runtime") as factory:
-        async with application.router.lifespan_context(application):
-            assert get_service(request) is service
-        factory.assert_not_called()
+    async with application.router.lifespan_context(application):
+        assert get_service(request) is service
+    assert runtime_calls == 0
     assert get_service(request) is service
 
 
 async def test_dbos_enqueue_is_durable_and_has_same_task_id() -> None:
-    client = create_autospec(DBOSClient, instance=True)
+    client = FakeWorkflowClient()
     executor = DBOSTasks(client, RuntimeSettings(_env_file=None))
     task = await executor.create(RunInput(goal="file missing"))
-    client.enqueue_async.assert_awaited_once()
-    options, task_id, goal, max_steps, correlation = client.enqueue_async.call_args.args
+    assert client.enqueue_attempts == 1
+    queued = client.enqueued[0]
+    options, task_id = queued.options, queued.task_id
+    goal, max_steps = queued.goal, queued.max_steps
     assert options["workflow_id"] == task_id == str(task.task_id)
     assert options["workflow_name"] == "etl_task" and options["queue_name"] == "etl_tasks"
     assert options["workflow_timeout"] == 180
     assert options["serialization_type"] == WorkflowSerializationFormat.PORTABLE
-    assert (goal, max_steps) == ("file missing", 1)
+    assert (goal, max_steps) == ("file missing", 5)
 
 
 @pytest.mark.parametrize(
@@ -278,20 +286,17 @@ async def test_dbos_enqueue_is_durable_and_has_same_task_id() -> None:
     ],
 )
 async def test_dbos_status_mapping(native: str, expected: str) -> None:
-    client = create_autospec(DBOSClient, instance=True)
-    workflow = create_autospec(WorkflowStatus, instance=True)
-    workflow.status = native
-    workflow.workflow_deadline_epoch_ms = None
-    client.list_workflows_async.return_value = [workflow]
+    client = FakeWorkflowClient()
+    client.workflows = [FakeWorkflow(status=native)]
     task = await DBOSTasks(client, RuntimeSettings(_env_file=None)).get(uuid4())
     assert task.status == expected
 
 
 async def test_dbos_enqueue_failure_is_not_retried() -> None:
-    client = create_autospec(DBOSClient, instance=True)
-    client.enqueue_async = AsyncMock(side_effect=RuntimeError("database unavailable"))
+    client = FakeWorkflowClient()
+    client.enqueue_error = RuntimeError("database unavailable")
     with pytest.raises(ExecutorUnavailable):
         await DBOSTasks(client, RuntimeSettings(_env_file=None)).create(
             RunInput(goal="file missing")
         )
-    client.enqueue_async.assert_awaited_once()
+    assert client.enqueue_attempts == 1

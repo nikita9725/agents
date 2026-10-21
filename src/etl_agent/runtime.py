@@ -1,4 +1,4 @@
-"""Настройки постоянной очереди и checkpoints без облачной лицензии."""
+"""Настройки постоянной очереди и checkpoints."""
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager

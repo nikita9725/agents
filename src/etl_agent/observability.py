@@ -1,5 +1,6 @@
 """Контекст запроса и безопасный вывод диагностических сообщений."""
 
+import json
 import logging
 import os
 import re
@@ -25,6 +26,15 @@ sensitive_values: ContextVar[tuple[str, ...]] = ContextVar("sensitive_values", d
 
 def protect_text(*values: str) -> None:
     sensitive_values.set((*sensitive_values.get(), *(value for value in values if value)))
+
+
+def tool_log_payload(value: object) -> str:
+    """Redact before truncation so a boundary cannot expose part of a known secret."""
+    text = json.dumps(value, ensure_ascii=False)
+    for secret in sorted(redacted_secrets.union(sensitive_values.get()), key=len, reverse=True):
+        if secret:
+            text = text.replace(json.dumps(secret, ensure_ascii=False)[1:-1], "[REDACTED]")
+    return text[:1024]
 
 
 class DiagnosticFormatter(logging.Formatter):

@@ -8,7 +8,7 @@ from uuid import UUID
 from etl_agent.domain import AgentState, Model, RunInput
 
 TaskStatus = Literal["pending", "running", "success", "error", "timeout", "interrupted"]
-NodeName = Literal["input", "planning", "finalization"]
+NodeName = Literal["input", "planning", "tools", "finalization"]
 TERMINAL = {"success", "error", "timeout", "interrupted"}
 
 

@@ -1,7 +1,8 @@
-"""Модели состояния и результатов, независимые от внешних фреймворков."""
+"""Типизированные модели состояния графа, сообщений и результатов."""
 
 from typing import Annotated, Literal
 
+from langchain_core.messages import AnyMessage
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -17,18 +18,24 @@ class NextAction(Model):
 
 
 class HistoryEntry(Model):
-    role: Literal["user", "assistant"]
-    node: Literal["input", "planning", "finalization"]
+    role: Literal["user", "assistant", "tool"]
+    node: Literal["input", "planning", "tools", "finalization"]
     content: NonEmptyText
 
 
 class RunInput(Model):
     goal: NonEmptyText
-    max_steps: int = Field(default=1, gt=0)
+    max_steps: int = Field(default=5, gt=0)
 
 
 class AgentState(RunInput):
+    messages: list[AnyMessage] = Field(default_factory=list)
     history: list[HistoryEntry] = Field(default_factory=list)
     current_step: int = Field(default=0, ge=0)
     next_action: NextAction | None = None
     final_answer: NonEmptyText | None = None
+
+
+class FinalResponse(Model):
+    final_answer: NonEmptyText
+    next_action: NextAction

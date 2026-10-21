@@ -1,8 +1,8 @@
 """Единственный публичный HTTP API приложения."""
 
 import logging
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Annotated
@@ -17,6 +17,8 @@ from etl_agent.domain import Model, RunInput
 from etl_agent.observability import request_id
 from etl_agent.tasks import ExecutorUnavailable, Task, TaskError, TaskNotFound, TaskService
 from etl_agent.worker import task_runtime
+
+RuntimeFactory = Callable[[], AbstractAsyncContextManager[TaskService]]
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,7 @@ def _error_response(
 @dataclass(slots=True)
 class AppResources:
     service: TaskService | None = None
+    runtime_factory: RuntimeFactory = task_runtime
 
 
 def _get_resources(application: FastAPI) -> AppResources:
@@ -58,7 +61,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     if resources.service is not None:
         yield
         return
-    async with task_runtime() as service:
+    async with resources.runtime_factory() as service:
         resources.service = service
         try:
             yield
@@ -183,13 +186,15 @@ async def events(
     )
 
 
-def create_app(service: TaskService | None = None) -> FastAPI:
+def create_app(
+    service: TaskService | None = None, *, runtime_factory: RuntimeFactory = task_runtime
+) -> FastAPI:
     application = FastAPI(
         title="ETL Tasks API",
         lifespan=lifespan,
         responses={code: {"model": ApiError} for code in (404, 422, 500, 503)},
     )
-    application.state.resources = AppResources(service=service)
+    application.state.resources = AppResources(service=service, runtime_factory=runtime_factory)
     application.include_router(router)
     application.middleware("http")(diagnostics)
     application.add_exception_handler(TaskNotFound, not_found)

@@ -1,6 +1,5 @@
 import json
 from dataclasses import asdict, dataclass
-from unittest.mock import patch
 
 import httpx
 import pytest
@@ -182,19 +181,14 @@ async def test_extra_body_reaches_provider_without_changing_function_contract(
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as transport_client:
-        # Exercise the planner's production construction path with an offline SDK transport.
-        with patch("etl_agent.infrastructure.planner.ChatOpenAI", wraps=ChatOpenAI) as factory:
-            factory.side_effect = lambda **kwargs: ChatOpenAI(
-                **kwargs,
-                http_async_client=transport_client,
-            )
-            planner = OpenAIPlanner(
-                base_url="https://provider.invalid/v1",
-                model="test-model",
-                api_key=SecretStr("test-key"),
-                extra_body=extra_body,
-            )
-            result = await planner.propose("Missing input file")
+        planner = OpenAIPlanner(
+            base_url="https://provider.invalid/v1",
+            model="test-model",
+            api_key=SecretStr("test-key"),
+            extra_body=extra_body,
+            http_async_client=transport_client,
+        )
+        result = await planner.propose("Missing input file")
     assert result.action == "Read logs"
     assert len(requests) == 1
     payload = json.loads(requests[0].content)

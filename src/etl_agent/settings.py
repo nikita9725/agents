@@ -1,6 +1,7 @@
 """Настройки окружения с маскированием секретов в строковом представлении."""
 
 import json
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import Field, JsonValue, SecretStr, field_validator
@@ -9,6 +10,8 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    tool_files_root: Path = Path("examples/tool_data")
 
     agent_port: int = Field(default=8123, ge=1, le=65535)
 

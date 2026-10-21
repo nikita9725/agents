@@ -1,55 +1,71 @@
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, Mock, patch
+from dataclasses import dataclass, field
 
 import pytest
+from pydantic import SecretStr
 
+from etl_agent.runtime import RuntimeSettings
 from etl_agent.worker import task_runtime
+from tests.fakes import FakeWorkflowClient
 
 pytestmark = pytest.mark.unit
 
 
-@pytest.mark.parametrize("failure", [None, "launch", "queue", "client", "body"])
+@dataclass(slots=True)
+class FakeRuntimeBackend:
+    failure: str | None = None
+    events: list[str] = field(default_factory=list)
+    client: FakeWorkflowClient = field(default_factory=FakeWorkflowClient)
+    shutdown_timeout: int | None = None
+    runtime_settings: RuntimeSettings = field(
+        default_factory=lambda: RuntimeSettings(
+            _env_file=None, task_database_url=SecretStr("postgresql://unused/unit")
+        )
+    )
+
+    def record(self, event: str) -> None:
+        self.events.append(event)
+        if self.failure == event:
+            raise RuntimeError(event)
+
+    async def prepare(self) -> None:
+        self.record("prepare")
+
+    def launch(self) -> None:
+        self.record("launch")
+
+    def register_queue(self) -> None:
+        self.record("queue")
+
+    def open_client(self) -> FakeWorkflowClient:
+        self.record("client")
+        return self.client
+
+    def shutdown(self, *, workflow_completion_timeout_sec: int) -> None:
+        self.shutdown_timeout = workflow_completion_timeout_sec
+        self.record("destroy")
+
+
+@pytest.mark.parametrize(
+    "failure", [None, "prepare", "launch", "queue", "client", "body", "destroy"]
+)
 async def test_runtime_owns_resources_and_cleans_up_partial_startup(failure: str | None) -> None:
-    events: list[str] = []
-
-    def record(name: str) -> None:
-        events.append(name)
-        if failure == name:
-            raise RuntimeError(name)
-
-    @asynccontextmanager
-    async def saver() -> AsyncIterator[Mock]:
-        yield Mock(setup=AsyncMock())
-
-    client = Mock(destroy=lambda: record("client.destroy"))
-    with (
-        patch("etl_agent.worker.configure_logging"),
-        patch("etl_agent.worker.checkpoints", side_effect=lambda settings: saver()),
-        patch("etl_agent.worker.DBOS") as dbos,
-        patch("etl_agent.worker.DBOSClient") as factory,
-    ):
-        dbos.launch.side_effect = lambda: record("launch")
-        dbos.register_queue.side_effect = lambda *args, **kwargs: record("queue")
-        dbos.destroy.side_effect = lambda **kwargs: record("destroy")
-
-        def create_client(**kwargs: object) -> Mock:
-            record("client")
-            return client
-
-        factory.side_effect = create_client
-        if failure:
-            with pytest.raises(RuntimeError, match=failure):
-                async with task_runtime():
-                    record("body")
-        else:
-            async with task_runtime():
-                record("body")
-        expected = ["launch", "queue", "client", "body"]
-        if failure:
-            expected = expected[: expected.index(failure) + 1]
+    backend = FakeRuntimeBackend(failure=failure)
+    if failure:
+        with pytest.raises(RuntimeError, match=failure):
+            async with task_runtime(backend) as service:
+                await service.ready()
+                backend.record("body")
+    else:
+        async with task_runtime(backend) as service:
+            await service.ready()
+            backend.record("body")
+    expected = ["prepare", "launch", "queue", "client", "body"]
+    if failure and failure != "destroy":
+        expected = expected[: expected.index(failure) + 1]
+    if failure != "prepare":
         expected.append("destroy")
-        if failure not in {"launch", "queue", "client"}:
-            expected.append("client.destroy")
-        assert events == expected
-        dbos.destroy.assert_called_once_with(workflow_completion_timeout_sec=25)
+    assert backend.events == expected
+    assert backend.shutdown_timeout == (None if failure == "prepare" else 25)
+    assert backend.client.destroy_calls == (
+        0 if failure in {"prepare", "launch", "queue", "client"} else 1
+    )

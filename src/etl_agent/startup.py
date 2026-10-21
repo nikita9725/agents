@@ -9,8 +9,7 @@ from etl_agent.settings import Settings
 PLACEHOLDERS = {"", "your-key", "replace-me", "your-langsmith-api-key"}
 
 
-def validate_startup() -> None:
-    settings = Settings()
+def validate_startup(settings: Settings) -> None:
     if not settings.llm_model.strip() or settings.llm_model == "your-model-name":
         raise ValueError("LLM_MODEL must be configured for real task execution")
     if settings.llm_api_key.get_secret_value().strip() in PLACEHOLDERS:
@@ -19,7 +18,7 @@ def validate_startup() -> None:
 
 def main() -> None:
     try:
-        validate_startup()
+        validate_startup(Settings())
     except ValueError as exc:
         # Pydantic errors may include rejected input values, including credentials.
         if isinstance(exc, ValidationError):

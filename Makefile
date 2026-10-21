@@ -8,14 +8,14 @@ help:
 	@echo 'setup | infra | run | up | build | down | logs | test | unit-test | integration-test | e2e-test | lint | pre-commit'
 
 setup:
-	uv sync --locked
-	uv run --locked pre-commit install
+	uv sync
+	uv run pre-commit install
 
 check-config:
-	uv run --locked python -m etl_agent.startup
+	uv run python -m etl_agent.startup
 
 run:
-	uv run --locked python -m etl_agent
+	uv run python -m etl_agent
 
 up: check-config
 	$(COMPOSE) up --remove-orphans --build -d --wait --wait-timeout 180
@@ -33,15 +33,15 @@ logs:
 	$(COMPOSE) logs -f
 
 lint:
-	uv run --locked ruff check .
-	uv run --locked ruff format --check .
-	uv run --locked mypy
+	uv run ruff check .
+	uv run ruff format --check .
+	uv run mypy
 
 pre-commit:
-	uv run --locked pre-commit run --all-files
+	uv run pre-commit run --all-files
 
 test:
-	uv run --locked pytest $(TEST_PATH) -q
+	uv run pytest $(TEST_PATH)
 
 unit-test:
 	$(MAKE) test TEST_PATH=tests/unit

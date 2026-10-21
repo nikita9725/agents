@@ -1,0 +1,3 @@
+2026-10-21 10:00:00 INFO sales load started expected_rows=120
+2026-10-21 10:00:01 ERROR sales load incomplete loaded_rows=90 rejected_rows=30
+2026-10-21 10:00:02 ERROR invalid date at row 2: 2026-99-21

@@ -11,3 +11,8 @@ DBOS сохраняет workflow с тем же UUID в PostgreSQL. В отде�
 
 Новые данные находятся в volume task_data. Старые volumes Agent Server и
 agents_postgres_data сохранены, автоматического переноса прежних задач нет.
+
+Состояние дня 2 содержит `messages`: HumanMessage, AIMessage с tool_calls и
+ToolMessage с observations. История допускает role=tool и node=tools. У завершённых
+результатов дня 1 messages по умолчанию пуст; их чтение сохраняется. Миграция
+активных checkpoints старого графа не выполняется.

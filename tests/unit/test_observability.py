@@ -68,3 +68,17 @@ def test_sdk_http_error_body_is_omitted_from_traceback() -> None:
     text = DiagnosticFormatter("%(message)s").format(record)
     assert "private-upstream-body-with-unknown-key" not in text
     assert "HTTPStatusError" in text and "Traceback" in text
+
+
+def test_tool_payload_masks_secret_before_truncation() -> None:
+    from etl_agent.observability import redacted_secrets, tool_log_payload
+
+    secret = 'unique-tool-secret-"with-quotes"'
+    redacted_secrets.add(secret)
+    try:
+        text = tool_log_payload("a" * 1010 + secret)
+        assert "unique-tool" not in text
+        assert "[REDACTED]" in text
+        assert len(text) <= 1024
+    finally:
+        redacted_secrets.discard(secret)

@@ -4,25 +4,26 @@ from collections.abc import Iterator
 import httpx
 import pytest
 from dotenv import dotenv_values
+from langsmith import tracing_context
 
+from etl_agent.settings import Settings
 from etl_agent.startup import validate_startup
 from tests.stack import ROOT, Stack
 
 
 @pytest.fixture(autouse=True)
-def disable_external_tracing(
-    request: pytest.FixtureRequest,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def disable_external_tracing(request: pytest.FixtureRequest) -> Iterator[None]:
     if request.node.get_closest_marker("unit") is not None:
-        monkeypatch.setenv("LANGSMITH_TRACING", "false")
-        monkeypatch.setenv("LANGCHAIN_TRACING_V2", "false")
+        with tracing_context(enabled=False):
+            yield
+    else:
+        yield
 
 
 @pytest.fixture(scope="session")
 def agent_stack() -> Iterator[Stack]:
     try:
-        validate_startup()
+        validate_startup(Settings())
     except ValueError as exc:
         pytest.fail(str(exc))
     stack = Stack()

@@ -1,10 +1,13 @@
 import json
+import re
 import time
 from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
 
+from etl_agent.infrastructure.tools import CalculatorOutput, FileOutput, SearchOutput
 from etl_agent.tasks import Task
 from tests.runtime_check import RuntimeInfo
 from tests.stack import Stack
@@ -38,7 +41,7 @@ def test_result_survives_container_recreation(
 
 
 def test_public_streaming(agent_client: httpx.Client) -> None:
-    task_id = submit(agent_client, "Учебная задача: неверный формат даты CSV")
+    task_id = submit(agent_client, "Используй calculator для вычисления (120-90)/120*100")
     with agent_client.stream("GET", f"/tasks/{task_id}/events", timeout=190) as response:
         assert response.status_code == 200
         events = list(response.iter_lines())
@@ -48,6 +51,7 @@ def test_public_streaming(agent_client: httpx.Client) -> None:
     assert {entry.get("node") for entry in data if "node" in entry} == {
         "input",
         "planning",
+        "tools",
         "finalization",
     }
     assert any(entry.get("status") == "success" for entry in data), data
@@ -110,18 +114,9 @@ def test_sigkill_recovers_same_run_without_resubmission(
         pytest.fail("No active task with a durable input checkpoint was observed")
     run_id = info.run_id
 
-    kill_started = time.time()
-    agent_stack.execute("crash", check=False, capture=True)
-    events = agent_stack.execute(
-        "events",
-        SINCE=str(int(kill_started) - 1),
-        UNTIL=str(int(time.time()) + 1),
-        CONTAINER=container,
-        capture=True,
-    )
-    deaths = [json.loads(line) for line in events.splitlines() if line.strip()]
-    assert deaths and deaths[-1]["Actor"]["Attributes"]["exitCode"] == "137", events
-    death_ns = int(deaths[-1]["timeNano"])
+    death = agent_stack.crash_and_observe(container)
+    assert death.exit_code == "137", death
+    death_ns = death.time_ns
     death_time = f"{death_ns // 1_000_000_000}.{death_ns % 1_000_000_000:09d}"
     logs = agent_stack.execute("logs", UNTIL=death_time, capture=True)
     matching = [line for line in logs.splitlines() if run_id in line]
@@ -142,20 +137,17 @@ def test_sigkill_recovers_same_run_without_resubmission(
 def test_real_invalid_key_is_a_terminal_error(
     agent_stack: Stack,
     agent_client: httpx.Client,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     try:
-        with monkeypatch.context() as patch:
-            patch.setenv("LLM_API_KEY", "invalid-native-e2e-verification")
-            agent_stack.execute("recreate-api")
-            ready(agent_stack)
-            task_id = submit(agent_client, "Учебная проверка неверного ключа")
-            result = wait_task(agent_client, task_id)
-            assert result.status == "error", result
-            assert result.error is not None and result.error.code == "execution_failed"
-            logs = agent_stack.execute("logs", capture=True)
-            matching = [line for line in logs.splitlines() if str(task_id) in line]
-            assert sum("event=node.started node=planning" in line for line in matching) == 1
+        agent_stack.execute("recreate-api", LLM_API_KEY="invalid-native-e2e-verification")
+        ready(agent_stack)
+        task_id = submit(agent_client, "Учебная проверка неверного ключа")
+        result = wait_task(agent_client, task_id)
+        assert result.status == "error", result
+        assert result.error is not None and result.error.code == "execution_failed"
+        logs = agent_stack.execute("logs", capture=True)
+        matching = [line for line in logs.splitlines() if str(task_id) in line]
+        assert sum("event=node.started node=planning" in line for line in matching) == 1
     finally:
         agent_stack.execute("recreate-api")
         ready(agent_stack)
@@ -174,3 +166,73 @@ def test_only_tasks_api_is_public(agent_stack: Stack, agent_client: httpx.Client
     for path in ("/threads", "/runs", "/assistants", "/store"):
         assert agent_client.get(path).status_code == 404
     assert agent_client.get("/ok").is_success
+
+
+def test_full_graph_reads_searches_and_calculates(agent_client: httpx.Client) -> None:
+    state = successful_state(
+        agent_client,
+        submit(
+            agent_client,
+            (
+                "Прочитай etl.log инструментом read_local_file и найди invalid date через text_search. "
+                "После получения содержимого файла вызови calculator для расчёта процента "
+                "отклонённых строк из expected_rows и rejected_rows. "
+                "В итоговом ответе укажи полученный процент числом со знаком %."
+            ),
+        ),
+    )
+    nodes = [entry.node for entry in state.history]
+    assert {"input", "planning", "tools", "finalization"} <= set(nodes)
+    assert (
+        nodes.index("tools")
+        < max(i for i, node in enumerate(nodes) if node == "planning")
+        < len(nodes) - 1
+    )
+
+    calls = {
+        call["id"]: (index, call["name"])
+        for index, message in enumerate(state.messages)
+        if isinstance(message, AIMessage)
+        for call in message.tool_calls
+    }
+    observations: dict[str, list[tuple[int, int, ToolMessage]]] = {}
+    for index, message in enumerate(state.messages):
+        if not isinstance(message, ToolMessage) or message.status != "success":
+            continue
+        assert message.tool_call_id in calls, message
+        call_index, name = calls[message.tool_call_id]
+        assert call_index < index
+        observations.setdefault(name, []).append((call_index, index, message))
+    assert {"read_local_file", "text_search", "calculator"} <= observations.keys()
+
+    read_indices: list[int] = []
+    for _, index, message in observations["read_local_file"]:
+        assert isinstance(message.content, str)
+        output = FileOutput.model_validate_json(message.content)
+        if "expected_rows=120" in output.content and "rejected_rows=30" in output.content:
+            read_indices.append(index)
+    assert read_indices, "No successful observation contains the ETL row counts"
+
+    matches = []
+    for _, _, message in observations["text_search"]:
+        assert isinstance(message.content, str)
+        matches.extend(SearchOutput.model_validate_json(message.content).matches)
+    assert any("invalid date" in match.text for match in matches)
+
+    calculation_indices: list[int] = []
+    for call_index, _, message in observations["calculator"]:
+        assert isinstance(message.content, str)
+        result = CalculatorOutput.model_validate_json(message.content).result
+        if result == pytest.approx(25.0):
+            calculation_indices.append(call_index)
+    assert any(
+        read < calculation for read in read_indices for calculation in calculation_indices
+    ), "Expected a calculation of 25% after reading row counts"
+    assert state.final_answer is not None
+    percentages = [
+        float(number.replace(",", "."))
+        for number in re.findall(r"(?<![\d.,+−-])(\d+(?:[.,]\d+)?)\s*%", state.final_answer)
+    ]
+    assert any(value == pytest.approx(25.0) for value in percentages), state.final_answer
+    assert state.next_action is not None
+    assert state.next_action.action.strip() and state.next_action.rationale.strip()

@@ -99,7 +99,13 @@ status и соответствующий tool_call_id. `result.history` допу
 Каждый ToolResult содержит `id`, `name`, `args`, `message` (исходный ToolMessage).
 Повторные вызовы используют сохранённый результат, но получают свой tool_call_id.
 `result.last_batch_new_results` показывает число новых результатов последнего пакета.
-`result.stop_reason`: criteria_met, no_new_results, step_limit или actor_finished.
+`result.stop_reason`: criteria_met, no_new_results, no_progress, step_limit или actor_finished.
+`result.consecutive_no_progress` — число последовательных пакетов без нового
+успешного результата; после двух агент завершает диагностику с no_progress.
+Сохранённый в кеше успех не обнуляет счётчик. Новая настройка запроса не требуется.
+Для старых результатов счётчик по умолчанию равен 0. Причина остановки и счётчик
+видны в state_delta событий trace; число новых успешных результатов пакета
+передаётся в delta tools как new_successful_results.
 
 `HistoryEntry` и SSE `progress` содержат необязательный `state_delta` (null у
 старых записей). Последняя запись каждого узла содержит его изменения state:

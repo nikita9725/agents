@@ -74,12 +74,15 @@ class RunInput(Model):
     max_steps: int = Field(default=5, gt=0)
 
 
-StopReason = Literal["criteria_met", "no_new_results", "step_limit", "actor_finished"]
+StopReason = Literal[
+    "criteria_met", "no_new_results", "no_progress", "step_limit", "actor_finished"
+]
 
 
 class AgentState(RunInput, WorkingMemory):
     tool_results: list[ToolResult] = Field(default_factory=list)
     last_batch_new_results: int = Field(default=0, ge=0)
+    consecutive_no_progress: int = Field(default=0, ge=0)
     stop_reason: StopReason | None = None
     plan: ExecutionPlan | None = None
     pending_observations: list[ToolMessage] = Field(default_factory=list)

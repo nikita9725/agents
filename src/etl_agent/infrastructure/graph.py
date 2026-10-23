@@ -1,4 +1,4 @@
-"""Durable tool-calling graph with bounded planning and persisted observations."""
+"""Восстанавливаемый граф вызова инструментов с ограничением шагов и сохранением наблюдений."""
 
 import json
 import logging
@@ -11,7 +11,7 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMes
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.config import get_config
-from langgraph.errors import NodeTimeoutError
+from langgraph.errors import GraphBubbleUp, NodeTimeoutError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
@@ -30,8 +30,8 @@ from etl_agent.domain import (
     StopReason,
     ToolResult,
 )
-from etl_agent.exceptions import PlanningTimeout, StepLimitExceeded, TransientPlanningError
-from etl_agent.infrastructure.tools import create_tools
+from etl_agent.exceptions import PlanningTimeout, TransientPlanningError
+from etl_agent.infrastructure.tools import ToolError, create_tools
 from etl_agent.memory import call_key, memory_input, model_context, validate_memory
 from etl_agent.observability import node_context, tool_log_payload
 
@@ -71,6 +71,7 @@ class ActingUpdate:
     messages: list[AnyMessage]
     current_step: int
     history: list[HistoryEntry]
+    stop_reason: StopReason | None = None
 
 
 @dataclass(slots=True)
@@ -87,6 +88,7 @@ class ObservationUpdate:
     notes: list[str]
     done_criteria: list[DoneCriterion]
     stop_reason: StopReason | None
+    consecutive_no_progress: int
     messages: list[AnyMessage]
     history: list[HistoryEntry]
     pending_observations: list[ToolMessage]
@@ -103,8 +105,8 @@ class FinalizationUpdate:
 class Nodes:
     def __init__(self, planner: Planner, tools: list[BaseTool]) -> None:
         self._planner = planner
-        # ToolNode's default handles invocation errors but propagates unexpected tool bugs.
-        self._tools = ToolNode(tools)
+        # Handle invocation failures at the per-call boundary, without exposing internals.
+        self._tools = ToolNode(tools, handle_tool_errors=False)
 
     @staticmethod
     async def initialize(state: RunInput) -> InputUpdate:
@@ -162,7 +164,20 @@ class Nodes:
 
     async def acting(self, state: AgentState, runtime: Runtime[None]) -> ActingUpdate:
         if state.current_step >= state.max_steps:
-            raise StepLimitExceeded("Action step budget exhausted")
+            return ActingUpdate(
+                messages=state.messages,
+                current_step=state.current_step,
+                history=[
+                    *state.history,
+                    HistoryEntry(
+                        role="assistant",
+                        node="acting",
+                        content="Бюджет шагов исчерпан; переход к финализации.",
+                        state_delta={"stop_reason": "step_limit"},
+                    ),
+                ],
+                stop_reason="step_limit",
+            )
         with node_context(get_config(), runtime, state.goal):
             started = perf_counter()
             attempt = runtime.execution_info.node_attempt if runtime.execution_info else 1
@@ -237,12 +252,23 @@ class Nodes:
                 )
                 try:
                     output = await self._tools.ainvoke([call], get_config())
+                except GraphBubbleUp:
+                    # Native graph interrupts and control flow are not tool failures.
+                    raise
                 except Exception:
                     logger.exception(
                         "event=tool.failed name=%s tool_call_id=%s", call["name"], call["id"]
                     )
-                    raise
-                result = output["messages"][0]
+                    result = ToolMessage(
+                        content=ToolError(
+                            error="Tool execution failed; check arguments or choose another tool"
+                        ).model_dump_json(),
+                        name=call["name"],
+                        tool_call_id=call["id"],
+                        status="error",
+                    )
+                else:
+                    result = output["messages"][0]
                 if not isinstance(result, ToolMessage):
                     raise TypeError("ToolNode must return ToolMessage")
                 logger.info(
@@ -270,6 +296,9 @@ class Nodes:
                 cache[key] = item
                 new_ids.append(result_id)
                 results.append(result)
+            new_successes = sum(
+                item.message.status == "success" for item in stored if item.id in new_ids
+            )
             return ToolsUpdate(
                 pending_observations=results,
                 tool_results=stored,
@@ -285,6 +314,7 @@ class Nodes:
                             "reused_result_ids": reused,
                             "pending_observations": len(results),
                             "last_batch_new_results": len(new_ids),
+                            "new_successful_results": new_successes,
                         },
                     ),
                 ],
@@ -294,11 +324,18 @@ class Nodes:
         with node_context(get_config(), runtime, state.goal):
             memory = await self._planner.update_memory(memory_input(state))
             validate_memory(state, memory)
+            has_progress = any(
+                result.status == "success" and not result.additional_kwargs.get("reused", False)
+                for result in state.pending_observations
+            )
+            consecutive_no_progress = 0 if has_progress else state.consecutive_no_progress + 1
             reason: StopReason | None = None
             if memory.done_criteria and all(item.satisfied for item in memory.done_criteria):
                 reason = "criteria_met"
             elif state.last_batch_new_results == 0:
                 reason = "no_new_results"
+            elif consecutive_no_progress >= 2:
+                reason = "no_progress"
             elif state.current_step >= state.max_steps:
                 reason = "step_limit"
             entries = [
@@ -311,6 +348,7 @@ class Nodes:
                 {
                     "pending_observations": 0,
                     "stop_reason": reason,
+                    "consecutive_no_progress": consecutive_no_progress,
                     "messages_count": len(state.messages) + len(entries),
                 }
             )
@@ -321,6 +359,7 @@ class Nodes:
                 notes=memory.notes,
                 done_criteria=memory.done_criteria,
                 stop_reason=reason,
+                consecutive_no_progress=consecutive_no_progress,
                 messages=[*state.messages, *state.pending_observations],
                 history=[*state.history, *entries],
                 pending_observations=[],
@@ -328,6 +367,8 @@ class Nodes:
 
     @staticmethod
     def after_acting(state: AgentState) -> Literal["tools", "finalization"]:
+        if state.stop_reason:
+            return "finalization"
         last = state.messages[-1]
         return "tools" if isinstance(last, AIMessage) and last.tool_calls else "finalization"
 
@@ -339,6 +380,7 @@ class Nodes:
         with node_context(get_config(), runtime, state.goal):
             messages: list[AnyMessage] = model_context(state)
             reason = state.stop_reason or "actor_finished"
+            messages.append(HumanMessage(content=f"Причина завершения диагностики: {reason}."))
             exhausted = reason == "step_limit"
             if exhausted:
                 messages.append(
@@ -356,12 +398,18 @@ class Nodes:
                 answer += (
                     "\nПовторные вызовы использовали сохранённые результаты; новых данных нет."
                 )
+            elif reason == "no_progress":
+                answer += "\nДиагностика остановлена: два пакета подряд не дали новых успешных результатов."
             remaining = [item.description for item in state.done_criteria if not item.satisfied]
             if remaining:
                 answer += "\nНе подтверждено: " + "; ".join(remaining)
             logger.info(
-                "event=node.completed node=finalization attempt=%s",
+                "event=node.completed node=finalization attempt=%s stop_reason=%s "
+                "current_step=%s max_steps=%s",
                 runtime.execution_info.node_attempt if runtime.execution_info else 1,
+                reason,
+                state.current_step,
+                state.max_steps,
             )
             return FinalizationUpdate(
                 stop_reason=reason,

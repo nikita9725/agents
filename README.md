@@ -132,3 +132,15 @@ AgentState содержит observations, tool_results, notes и done_criteria. 
 Причина завершения видна в ответе, trace и логах; счётчик пакетов без прогресса
 сохраняется в checkpoints. [Правила остановки](docs/graph.md) и
 [проверяемые сценарии](docs/testing.md#день-5).
+
+
+## Наблюдаемость — день 6
+
+Граф пишет выбранные узлы и действия, вызовы tools, observations, краткие изменения
+состояния, попытки, длительности и ошибки. `task_id` связывает логи, SSE,
+checkpoints и LangSmith; при восстановлении создаётся новый `run_id`.
+
+LangSmith включается через `LANGSMITH_TRACING=true`, `LANGSMITH_PROJECT`,
+`LANGSMITH_API_KEY` и при необходимости `LANGSMITH_ENDPOINT` в `.env`.
+По умолчанию внешняя трассировка выключена. Ошибка доставки не меняет результат задачи.
+[Настройка, три сценария, схемы выполнения и failure modes](docs/observability.md#день-6).

@@ -6,17 +6,15 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Protocol
-from uuid import UUID
 
 from dbos import DBOS, DBOSClient, DBOSConfig, WorkflowSerializationFormat
-from langchain_core.runnables import RunnableConfig
 
 from etl_agent.domain import AgentState, RunInput
 from etl_agent.infrastructure.graph import build_graph
 from etl_agent.infrastructure.planner import OpenAIPlanner
 from etl_agent.infrastructure.task_executor import DBOSTasks, WorkflowClient
 from etl_agent.infrastructure.tools import create_tools
-from etl_agent.observability import configure_logging
+from etl_agent.observability import configure_logging, execution_config, execution_tracing
 from etl_agent.runtime import (
     APPLICATION_NAME,
     QUEUE_NAME,
@@ -25,6 +23,7 @@ from etl_agent.runtime import (
     checkpoints,
 )
 from etl_agent.settings import Settings
+from etl_agent.startup import validate_startup
 from etl_agent.tasks import TaskService
 
 logger = logging.getLogger(__name__)
@@ -46,17 +45,13 @@ async def _run_graph(task_id: str, goal: str, max_steps: int, request_id: str | 
             tools=tools,
             checkpointer=saver,
         )
-        config: RunnableConfig = {
-            "configurable": {"thread_id": task_id},
-            "metadata": {"task_id": task_id, "request_id": request_id},
-            "run_id": UUID(task_id),
-            "recursion_limit": max(25, max_steps * 3 + 5),
-        }
+        config = execution_config(task_id, request_id, max_steps)
         snapshot = await graph.aget_state(config)
         if snapshot.values and not snapshot.next:
             return AgentState.model_validate(snapshot.values).model_dump_json()
         state = None if snapshot.values else RunInput(goal=goal, max_steps=max_steps)
-        result = await graph.ainvoke(state, config, durability="sync")
+        async with execution_tracing(settings):
+            result = await graph.ainvoke(state, config, durability="sync")
         return AgentState.model_validate(result).model_dump_json()
 
 
@@ -90,7 +85,15 @@ class DBOSRuntimeBackend:
     runtime_settings: RuntimeSettings
 
     async def prepare(self) -> None:
-        configure_logging([self.settings.llm_api_key.get_secret_value()])
+        validate_startup(self.settings)
+        configure_logging(
+            [
+                self.settings.llm_api_key.get_secret_value(),
+                self.settings.langsmith_api_key.get_secret_value()
+                if self.settings.langsmith_api_key
+                else "",
+            ]
+        )
         async with checkpoints(self.runtime_settings) as saver:
             await saver.setup()
         config: DBOSConfig = {

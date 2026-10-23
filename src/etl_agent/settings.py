@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     llm_api_key: SecretStr
     langsmith_tracing: bool = False
     langsmith_project: str = "etl-agent"
+    langsmith_endpoint: str = "https://api.smith.langchain.com"
     langsmith_api_key: SecretStr | None = None
 
     @field_validator("llm_extra_body", mode="before")

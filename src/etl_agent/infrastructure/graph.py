@@ -33,7 +33,7 @@ from etl_agent.domain import (
 from etl_agent.exceptions import PlanningTimeout, TransientPlanningError
 from etl_agent.infrastructure.tools import ToolError, create_tools
 from etl_agent.memory import call_key, memory_input, model_context, validate_memory
-from etl_agent.observability import node_context, tool_log_payload
+from etl_agent.observability import node_context, observed_node, tool_log_payload
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ class Nodes:
         self._tools = ToolNode(tools, handle_tool_errors=False)
 
     @staticmethod
-    async def initialize(state: RunInput) -> InputUpdate:
+    async def initialize(state: RunInput, runtime: Runtime[None]) -> InputUpdate:
         return InputUpdate(
             messages=[HumanMessage(content=state.goal)],
             history=[
@@ -123,47 +123,33 @@ class Nodes:
         )
 
     async def planning(self, state: AgentState, runtime: Runtime[None]) -> PlanningUpdate:
-        with node_context(get_config(), runtime, state.goal):
-            started = perf_counter()
-            attempt = runtime.execution_info.node_attempt if runtime.execution_info else 1
-            logger.info("event=node.started node=planning attempt=%s", attempt)
-            try:
-                plan = await self._planner.create_plan(state.goal)
-            except Exception:
-                logger.exception("event=node.failed node=planning attempt=%s", attempt)
-                raise
-            # Planning cannot claim evidence before any tool has executed.
-            criteria = [DoneCriterion(description=item.description) for item in plan.done_criteria]
-            plan = plan.model_copy(update={"done_criteria": criteria})
-            text = "План:\n" + "\n".join(
-                f"{index}. {step}" for index, step in enumerate(plan.steps, 1)
-            )
-            logger.info(
-                "event=node.completed node=planning attempt=%s elapsed_ms=%.1f",
-                attempt,
-                (perf_counter() - started) * 1000,
-            )
-            return PlanningUpdate(
-                done_criteria=criteria,
-                plan=plan,
-                messages=[*state.messages, AIMessage(content=text)],
-                history=[
-                    *state.history,
-                    HistoryEntry(
-                        role="assistant",
-                        node="planning",
-                        content=text,
-                        state_delta={
-                            "plan": plan.model_dump(mode="json"),
-                            "done_criteria": [item.model_dump(mode="json") for item in criteria],
-                            "messages_count": len(state.messages) + 1,
-                        },
-                    ),
-                ],
-            )
+        plan = await self._planner.create_plan(state.goal)
+        # Planning cannot claim evidence before any tool has executed.
+        criteria = [DoneCriterion(description=item.description) for item in plan.done_criteria]
+        plan = plan.model_copy(update={"done_criteria": criteria})
+        text = "План:\n" + "\n".join(f"{index}. {step}" for index, step in enumerate(plan.steps, 1))
+        return PlanningUpdate(
+            done_criteria=criteria,
+            plan=plan,
+            messages=[*state.messages, AIMessage(content=text)],
+            history=[
+                *state.history,
+                HistoryEntry(
+                    role="assistant",
+                    node="planning",
+                    content=text,
+                    state_delta={
+                        "plan": plan.model_dump(mode="json"),
+                        "done_criteria": [item.model_dump(mode="json") for item in criteria],
+                        "messages_count": len(state.messages) + 1,
+                    },
+                ),
+            ],
+        )
 
     async def acting(self, state: AgentState, runtime: Runtime[None]) -> ActingUpdate:
         if state.current_step >= state.max_steps:
+            logger.info("event=action.chosen kind=finish stop_reason=step_limit")
             return ActingUpdate(
                 messages=state.messages,
                 current_step=state.current_step,
@@ -178,257 +164,275 @@ class Nodes:
                 ],
                 stop_reason="step_limit",
             )
-        with node_context(get_config(), runtime, state.goal):
-            started = perf_counter()
-            attempt = runtime.execution_info.node_attempt if runtime.execution_info else 1
-            logger.info("event=node.started node=acting attempt=%s", attempt)
-            try:
-                message = await self._planner.act(model_context(state))
-            except Exception:
-                logger.exception("event=node.failed node=acting attempt=%s", attempt)
-                raise
-            logger.info(
-                "event=node.completed node=acting attempt=%s elapsed_ms=%.1f",
-                attempt,
-                (perf_counter() - started) * 1000,
-            )
-            parts: list[str] = [message.text] if message.text else []
-            if message.tool_calls:
-                parts.append(json.dumps(message.tool_calls, ensure_ascii=False))
-            return ActingUpdate(
-                messages=[*state.messages, message],
-                current_step=state.current_step + 1,
-                history=[
-                    *state.history,
-                    HistoryEntry(
-                        role="assistant",
-                        node="acting",
-                        content="\n".join(parts) or "Диагностика завершена",
-                        state_delta={
-                            "current_step": state.current_step + 1,
-                            "messages_count": len(state.messages) + 1,
-                        },
-                    ),
-                ],
-            )
+        message = await self._planner.act(model_context(state))
+        logger.info(
+            "event=action.chosen kind=%s tool_calls=%s",
+            "tools" if message.tool_calls else "finish",
+            tool_log_payload(message.tool_calls),
+        )
+        parts: list[str] = [message.text] if message.text else []
+        if message.tool_calls:
+            parts.append(json.dumps(message.tool_calls, ensure_ascii=False))
+        return ActingUpdate(
+            messages=[*state.messages, message],
+            current_step=state.current_step + 1,
+            history=[
+                *state.history,
+                HistoryEntry(
+                    role="assistant",
+                    node="acting",
+                    content="\n".join(parts) or "Диагностика завершена",
+                    state_delta={
+                        "current_step": state.current_step + 1,
+                        "messages_count": len(state.messages) + 1,
+                    },
+                ),
+            ],
+        )
 
     async def tools(self, state: AgentState, runtime: Runtime[None]) -> ToolsUpdate:
-        with node_context(get_config(), runtime, state.goal):
-            message = state.messages[-1]
-            if not isinstance(message, AIMessage):
-                raise ValueError("Tools require an AIMessage")
-            # Execute individually so logs pair each call with its own result and duration.
-            results: list[ToolMessage] = []
-            cache = {call_key(item.name, item.args): item for item in state.tool_results}
-            stored = list(state.tool_results)
-            reused: list[str] = []
-            new_ids: list[str] = []
-            for call in message.tool_calls:
-                key = call_key(call["name"], call["args"])
-                if key in cache:
-                    cached = cache[key]
-                    results.append(
-                        cached.message.model_copy(
-                            update={
-                                "tool_call_id": call["id"],
-                                "additional_kwargs": {"result_id": cached.id, "reused": True},
-                            }
-                        )
+        message = state.messages[-1]
+        if not isinstance(message, AIMessage):
+            raise ValueError("Tools require an AIMessage")
+        # Execute individually so logs pair each call with its own result and duration.
+        results: list[ToolMessage] = []
+        cache = {call_key(item.name, item.args): item for item in state.tool_results}
+        stored = list(state.tool_results)
+        reused: list[str] = []
+        new_ids: list[str] = []
+        for call in message.tool_calls:
+            key = call_key(call["name"], call["args"])
+            if key in cache:
+                cached = cache[key]
+                results.append(
+                    cached.message.model_copy(
+                        update={
+                            "tool_call_id": call["id"],
+                            "additional_kwargs": {"result_id": cached.id, "reused": True},
+                        }
                     )
-                    reused.append(cached.id)
-                    logger.info(
-                        "event=tool.reused name=%s result_id=%s tool_call_id=%s",
-                        call["name"],
-                        cached.id,
-                        call["id"],
-                    )
-                    continue
-                started = perf_counter()
+                )
+                reused.append(cached.id)
                 logger.info(
-                    "event=tool.started name=%s tool_call_id=%s args=%s",
+                    "event=tool.reused name=%s result_id=%s tool_call_id=%s",
                     call["name"],
+                    cached.id,
                     call["id"],
-                    tool_log_payload(call["args"]),
                 )
-                try:
-                    output = await self._tools.ainvoke([call], get_config())
-                except GraphBubbleUp:
-                    # Native graph interrupts and control flow are not tool failures.
-                    raise
-                except Exception:
-                    logger.exception(
-                        "event=tool.failed name=%s tool_call_id=%s", call["name"], call["id"]
-                    )
-                    result = ToolMessage(
-                        content=ToolError(
-                            error="Tool execution failed; check arguments or choose another tool"
-                        ).model_dump_json(),
-                        name=call["name"],
-                        tool_call_id=call["id"],
-                        status="error",
-                    )
-                else:
-                    result = output["messages"][0]
-                if not isinstance(result, ToolMessage):
-                    raise TypeError("ToolNode must return ToolMessage")
-                logger.info(
-                    "event=tool.completed name=%s tool_call_id=%s status=%s elapsed_ms=%.1f result=%s",
-                    call["name"],
-                    call["id"],
-                    result.status,
-                    (perf_counter() - started) * 1000,
-                    tool_log_payload(result.content),
-                )
-                result_id = f"result_{len(stored) + 1}"
-                result = result.model_copy(
-                    update={
-                        "additional_kwargs": {
-                            **result.additional_kwargs,
-                            "result_id": result_id,
-                            "reused": False,
-                        },
-                    }
-                )
-                item = ToolResult(
-                    id=result_id, name=call["name"], args=call["args"], message=result
-                )
-                stored.append(item)
-                cache[key] = item
-                new_ids.append(result_id)
-                results.append(result)
-            new_successes = sum(
-                item.message.status == "success" for item in stored if item.id in new_ids
+                continue
+            started = perf_counter()
+            result_id = f"result_{len(stored) + 1}"
+            logger.info(
+                "event=tool.started name=%s tool_call_id=%s result_id=%s args=%s",
+                call["name"],
+                call["id"],
+                result_id,
+                tool_log_payload(call["args"]),
             )
-            return ToolsUpdate(
-                pending_observations=results,
-                tool_results=stored,
-                last_batch_new_results=len(new_ids),
-                history=[
-                    *state.history,
-                    HistoryEntry(
-                        role="assistant",
-                        node="tools",
-                        content=f"Новых результатов: {len(new_ids)}; из памяти: {len(reused)}",
-                        state_delta={
-                            "new_result_ids": new_ids,
-                            "reused_result_ids": reused,
-                            "pending_observations": len(results),
-                            "last_batch_new_results": len(new_ids),
-                            "new_successful_results": new_successes,
-                        },
-                    ),
-                ],
+            try:
+                output = await self._tools.ainvoke([call], get_config())
+            except GraphBubbleUp:
+                # Native graph interrupts and control flow are not tool failures.
+                raise
+            except Exception:
+                logger.exception(
+                    "event=tool.failed name=%s tool_call_id=%s", call["name"], call["id"]
+                )
+                result = ToolMessage(
+                    content=ToolError(
+                        error="Tool execution failed; check arguments or choose another tool"
+                    ).model_dump_json(),
+                    name=call["name"],
+                    tool_call_id=call["id"],
+                    status="error",
+                )
+            else:
+                result = output["messages"][0]
+            if not isinstance(result, ToolMessage):
+                raise TypeError("ToolNode must return ToolMessage")
+            logger.info(
+                "event=tool.completed name=%s tool_call_id=%s status=%s result_id=%s "
+                "elapsed_ms=%.1f result=%s",
+                call["name"],
+                call["id"],
+                result.status,
+                result_id,
+                (perf_counter() - started) * 1000,
+                tool_log_payload(result.content),
             )
-
-    async def observation(self, state: AgentState, runtime: Runtime[None]) -> ObservationUpdate:
-        with node_context(get_config(), runtime, state.goal):
-            memory = await self._planner.update_memory(memory_input(state))
-            validate_memory(state, memory)
-            has_progress = any(
-                result.status == "success" and not result.additional_kwargs.get("reused", False)
-                for result in state.pending_observations
-            )
-            consecutive_no_progress = 0 if has_progress else state.consecutive_no_progress + 1
-            reason: StopReason | None = None
-            if memory.done_criteria and all(item.satisfied for item in memory.done_criteria):
-                reason = "criteria_met"
-            elif state.last_batch_new_results == 0:
-                reason = "no_new_results"
-            elif consecutive_no_progress >= 2:
-                reason = "no_progress"
-            elif state.current_step >= state.max_steps:
-                reason = "step_limit"
-            entries = [
-                HistoryEntry(role="tool", node="observation", content=result.model_dump_json())
-                for result in state.pending_observations
-            ]
-            # One durable delta per graph node, attached to its final history entry.
-            delta = memory.model_dump(mode="json")
-            delta.update(
-                {
-                    "pending_observations": 0,
-                    "stop_reason": reason,
-                    "consecutive_no_progress": consecutive_no_progress,
-                    "messages_count": len(state.messages) + len(entries),
+            result = result.model_copy(
+                update={
+                    "additional_kwargs": {
+                        **result.additional_kwargs,
+                        "result_id": result_id,
+                        "reused": False,
+                    },
                 }
             )
-            entries[-1] = entries[-1].model_copy(update={"state_delta": delta})
-            logger.info("event=node.completed node=observation stop_reason=%s", reason)
-            return ObservationUpdate(
-                observations=memory.observations,
-                notes=memory.notes,
-                done_criteria=memory.done_criteria,
-                stop_reason=reason,
-                consecutive_no_progress=consecutive_no_progress,
-                messages=[*state.messages, *state.pending_observations],
-                history=[*state.history, *entries],
-                pending_observations=[],
+            item = ToolResult(id=result_id, name=call["name"], args=call["args"], message=result)
+            logger.info(
+                "event=observation.received name=%s tool_call_id=%s result_id=%s status=%s",
+                call["name"],
+                call["id"],
+                result_id,
+                result.status,
             )
+            stored.append(item)
+            cache[key] = item
+            new_ids.append(result_id)
+            results.append(result)
+        new_successes = sum(
+            item.message.status == "success" for item in stored if item.id in new_ids
+        )
+        return ToolsUpdate(
+            pending_observations=results,
+            tool_results=stored,
+            last_batch_new_results=len(new_ids),
+            history=[
+                *state.history,
+                HistoryEntry(
+                    role="assistant",
+                    node="tools",
+                    content=f"Новых результатов: {len(new_ids)}; из памяти: {len(reused)}",
+                    state_delta={
+                        "new_result_ids": new_ids,
+                        "reused_result_ids": reused,
+                        "pending_observations": len(results),
+                        "last_batch_new_results": len(new_ids),
+                        "new_successful_results": new_successes,
+                    },
+                ),
+            ],
+        )
+
+    async def observation(self, state: AgentState, runtime: Runtime[None]) -> ObservationUpdate:
+        memory = await self._planner.update_memory(memory_input(state))
+        validate_memory(state, memory)
+        has_progress = any(
+            result.status == "success" and not result.additional_kwargs.get("reused", False)
+            for result in state.pending_observations
+        )
+        consecutive_no_progress = 0 if has_progress else state.consecutive_no_progress + 1
+        reason: StopReason | None = None
+        if memory.done_criteria and all(item.satisfied for item in memory.done_criteria):
+            reason = "criteria_met"
+        elif state.last_batch_new_results == 0:
+            reason = "no_new_results"
+        elif consecutive_no_progress >= 2:
+            reason = "no_progress"
+        elif state.current_step >= state.max_steps:
+            reason = "step_limit"
+        entries = [
+            HistoryEntry(role="tool", node="observation", content=result.model_dump_json())
+            for result in state.pending_observations
+        ]
+        # One durable delta per graph node, attached to its final history entry.
+        delta = memory.model_dump(mode="json")
+        delta.update(
+            {
+                "pending_observations": 0,
+                "stop_reason": reason,
+                "consecutive_no_progress": consecutive_no_progress,
+                "messages_count": len(state.messages) + len(entries),
+            }
+        )
+        entries[-1] = entries[-1].model_copy(update={"state_delta": delta})
+        return ObservationUpdate(
+            observations=memory.observations,
+            notes=memory.notes,
+            done_criteria=memory.done_criteria,
+            stop_reason=reason,
+            consecutive_no_progress=consecutive_no_progress,
+            messages=[*state.messages, *state.pending_observations],
+            history=[*state.history, *entries],
+            pending_observations=[],
+        )
 
     @staticmethod
-    def after_acting(state: AgentState) -> Literal["tools", "finalization"]:
-        if state.stop_reason:
-            return "finalization"
+    def after_acting(state: AgentState, runtime: Runtime[None]) -> Literal["tools", "finalization"]:
         last = state.messages[-1]
-        return "tools" if isinstance(last, AIMessage) and last.tool_calls else "finalization"
+        chosen: Literal["tools", "finalization"] = (
+            "finalization"
+            if state.stop_reason
+            else "tools"
+            if isinstance(last, AIMessage) and last.tool_calls
+            else "finalization"
+        )
+        with node_context(get_config(), runtime, state.goal):
+            logger.info(
+                "event=node.chosen node=acting next_node=%s stop_reason=%s",
+                chosen,
+                state.stop_reason or ("actor_finished" if chosen == "finalization" else None),
+            )
+        return chosen
 
     @staticmethod
-    def after_observation(state: AgentState) -> Literal["acting", "finalization"]:
-        return "finalization" if state.stop_reason else "acting"
+    def after_observation(
+        state: AgentState, runtime: Runtime[None]
+    ) -> Literal["acting", "finalization"]:
+        chosen: Literal["acting", "finalization"] = (
+            "finalization" if state.stop_reason else "acting"
+        )
+        with node_context(get_config(), runtime, state.goal):
+            logger.info(
+                "event=node.chosen node=observation next_node=%s stop_reason=%s",
+                chosen,
+                state.stop_reason,
+            )
+        return chosen
 
     async def finalization(self, state: AgentState, runtime: Runtime[None]) -> FinalizationUpdate:
-        with node_context(get_config(), runtime, state.goal):
-            messages: list[AnyMessage] = model_context(state)
-            reason = state.stop_reason or "actor_finished"
-            messages.append(HumanMessage(content=f"Причина завершения диагностики: {reason}."))
-            exhausted = reason == "step_limit"
-            if exhausted:
-                messages.append(
-                    HumanMessage(
-                        content="Бюджет инструментальных шагов исчерпан. Заверши по имеющимся наблюдениям и укажи это ограничение."
-                    )
+        messages: list[AnyMessage] = model_context(state)
+        reason = state.stop_reason or "actor_finished"
+        messages.append(HumanMessage(content=f"Причина завершения диагностики: {reason}."))
+        exhausted = reason == "step_limit"
+        if exhausted:
+            messages.append(
+                HumanMessage(
+                    content="Бюджет инструментальных шагов исчерпан. Заверши по имеющимся наблюдениям и укажи это ограничение."
                 )
-            response = await self._planner.finalize(messages)
-            answer = response.final_answer
-            if exhausted:
-                answer += "\nБюджет инструментальных шагов исчерпан; вывод основан на полученных наблюдениях."
-            if reason == "criteria_met":
-                answer += "\nКритерии диагностики выполнены по сохранённым наблюдениям."
-            elif reason == "no_new_results":
-                answer += (
-                    "\nПовторные вызовы использовали сохранённые результаты; новых данных нет."
-                )
-            elif reason == "no_progress":
-                answer += "\nДиагностика остановлена: два пакета подряд не дали новых успешных результатов."
-            remaining = [item.description for item in state.done_criteria if not item.satisfied]
-            if remaining:
-                answer += "\nНе подтверждено: " + "; ".join(remaining)
-            logger.info(
-                "event=node.completed node=finalization attempt=%s stop_reason=%s "
-                "current_step=%s max_steps=%s",
-                runtime.execution_info.node_attempt if runtime.execution_info else 1,
-                reason,
-                state.current_step,
-                state.max_steps,
             )
-            return FinalizationUpdate(
-                stop_reason=reason,
-                next_action=response.next_action,
-                final_answer=answer,
-                history=[
-                    *state.history,
-                    HistoryEntry(
-                        role="assistant",
-                        node="finalization",
-                        content=answer,
-                        state_delta={
-                            "stop_reason": reason,
-                            "final_answer": answer,
-                            "next_action": response.next_action.model_dump(mode="json"),
-                        },
-                    ),
-                ],
+        response = await self._planner.finalize(messages)
+        answer = response.final_answer
+        if exhausted:
+            answer += (
+                "\nБюджет инструментальных шагов исчерпан; вывод основан на полученных наблюдениях."
             )
+        if reason == "criteria_met":
+            answer += "\nКритерии диагностики выполнены по сохранённым наблюдениям."
+        elif reason == "no_new_results":
+            answer += "\nПовторные вызовы использовали сохранённые результаты; новых данных нет."
+        elif reason == "no_progress":
+            answer += (
+                "\nДиагностика остановлена: два пакета подряд не дали новых успешных результатов."
+            )
+        remaining = [item.description for item in state.done_criteria if not item.satisfied]
+        if remaining:
+            answer += "\nНе подтверждено: " + "; ".join(remaining)
+        logger.info(
+            "event=diagnosis.completed stop_reason=%s current_step=%s max_steps=%s",
+            reason,
+            state.current_step,
+            state.max_steps,
+        )
+        return FinalizationUpdate(
+            stop_reason=reason,
+            next_action=response.next_action,
+            final_answer=answer,
+            history=[
+                *state.history,
+                HistoryEntry(
+                    role="assistant",
+                    node="finalization",
+                    content=answer,
+                    state_delta={
+                        "stop_reason": reason,
+                        "final_answer": answer,
+                        "next_action": response.next_action.model_dump(mode="json"),
+                    },
+                ),
+            ],
+        )
 
 
 def build_graph[Version: (int, float, str)](
@@ -441,29 +445,31 @@ def build_graph[Version: (int, float, str)](
 ) -> CompiledStateGraph[AgentState, None, RunInput, AgentState]:
     nodes = Nodes(planner, tools if tools is not None else create_tools(Path("examples/tool_data")))
     builder = StateGraph(AgentState, input_schema=RunInput)
-    builder.add_node("input", nodes.initialize, timeout=5)
+    builder.add_node(
+        "input", observed_node("input", nodes.initialize), input_schema=RunInput, timeout=5
+    )
     builder.add_node(
         "planning",
-        nodes.planning,
+        observed_node("planning", nodes.planning),
         retry_policy=retry_policy,
         timeout=TimeoutPolicy(run_timeout=planning_timeout),
     )
     builder.add_node(
         "acting",
-        nodes.acting,
+        observed_node("acting", nodes.acting),
         retry_policy=retry_policy,
         timeout=TimeoutPolicy(run_timeout=planning_timeout),
     )
-    builder.add_node("tools", nodes.tools, timeout=10)
+    builder.add_node("tools", observed_node("tools", nodes.tools), timeout=10)
     builder.add_node(
         "observation",
-        nodes.observation,
+        observed_node("observation", nodes.observation),
         retry_policy=retry_policy,
         timeout=TimeoutPolicy(run_timeout=planning_timeout),
     )
     builder.add_node(
         "finalization",
-        nodes.finalization,
+        observed_node("finalization", nodes.finalization),
         retry_policy=retry_policy,
         timeout=TimeoutPolicy(run_timeout=planning_timeout),
     )

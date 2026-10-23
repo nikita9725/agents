@@ -78,3 +78,32 @@ def test_real_read_then_calculate(agent_client: httpx.Client) -> None:
     assert nodes.count("acting") >= 2 and nodes.count("observation") >= 2
     assert nodes.index("observation") < max(i for i, node in enumerate(nodes) if node == "acting")
     assert state.final_answer and "25" in state.final_answer
+
+
+def test_real_partial_result_keeps_success_and_reports_missing_file(
+    agent_client: httpx.Client,
+) -> None:
+    state = successful_state(
+        agent_client,
+        submit(
+            agent_client,
+            "Вычисли 2+2 через calculator и прочитай missing.log через read_local_file. "
+            "Если файл недоступен, явно укажи ограничение и не придумывай его содержимое.",
+        ),
+    )
+    results = state.tool_results
+    assert any(
+        item.name == "calculator"
+        and item.message.status == "success"
+        and json.loads(str(item.message.content))["result"] == 4
+        for item in results
+    )
+    assert any(
+        item.name == "read_local_file"
+        and item.args.get("path") == "missing.log"
+        and item.message.status == "error"
+        for item in results
+    )
+    assert state.final_answer and "4" in state.final_answer
+    assert "missing.log" in state.final_answer
+    assert state.stop_reason is not None

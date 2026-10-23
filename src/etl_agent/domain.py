@@ -102,3 +102,4 @@ class MemoryInput(WorkingMemory):
     goal: NonEmptyText
     plan: ExecutionPlan | None
     results: list[ToolResult]
+    validation_feedback: NonEmptyText | None = None

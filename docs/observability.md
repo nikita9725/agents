@@ -208,3 +208,27 @@ flowchart LR
 Общий дедлайн и пользовательская отмена могут выглядеть одинаково внутри узла;
 различайте их по конечному статусу задачи в API. Ошибка tools, возвращённая как
 ToolMessage, может иметь успешный span вызова: для диагностики проверяйте и output.status.
+
+## Локальная приёмка дня 7
+
+Для финальных demo используется `LANGSMITH_TRACING=false`: облачная отправка
+отключена по выбору пользователя. Полные реальные traces сохраняются как JSON
+результата и SSE в [examples/traces](../examples/traces/README.md).
+Они содержат завершённые узлы и изменения state; попытки LLM и длительности
+дополнительно доступны в структурированных серверных логах.
+
+Интеграция LangSmith SDK проверяется `tests/unit/test_tracing.py` через транспорт
+в памяти. Эти тесты не заменяют проверку доставки в сервис. Self-hosted LangSmith
+требует [Enterprise-лицензию](https://support.langchain.com/articles/7011309930-how-do-i-obtain-a-self-hosted-langsmith-license-key?threadId=e36a19aa-55cd-4e87-9fbd-3bf326e4696e);
+в учебный стек он не включён. LangGraph, LangChain и локальная история работают
+без лицензии LangSmith.
+
+Чтобы сохранить собственный завершённый запуск, возьмите task_id из клиента:
+
+```sh
+curl --fail 'http://127.0.0.1:8123/tasks/<task_id>' -o result.json
+curl --fail -N 'http://127.0.0.1:8123/tasks/<task_id>/events' -o trace.sse
+```
+
+SSE повторно отдаёт сохранённую историю и терминальный snapshot; результат
+можно изучать после завершения задачи без повторных LLM/tool calls.

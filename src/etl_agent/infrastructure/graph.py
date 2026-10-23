@@ -30,7 +30,7 @@ from etl_agent.domain import (
     StopReason,
     ToolResult,
 )
-from etl_agent.exceptions import PlanningTimeout, TransientPlanningError
+from etl_agent.exceptions import PlanningError, PlanningTimeout, TransientPlanningError
 from etl_agent.infrastructure.tools import ToolError, create_tools
 from etl_agent.memory import call_key, memory_input, model_context, validate_memory
 from etl_agent.observability import node_context, observed_node, tool_log_payload
@@ -306,8 +306,24 @@ class Nodes:
         )
 
     async def observation(self, state: AgentState, runtime: Runtime[None]) -> ObservationUpdate:
-        memory = await self._planner.update_memory(memory_input(state))
-        validate_memory(state, memory)
+        context = memory_input(state)
+        memory = await self._planner.update_memory(context)
+        try:
+            validate_memory(state, memory)
+        except PlanningError as error:
+            # One bounded correction; never repeat tools or accept invalid evidence.
+            logger.warning("event=memory.validation_failed correction_attempt=1")
+            context = context.model_copy(
+                update={
+                    "validation_feedback": (
+                        f"Previous memory update was rejected: {error}. "
+                        "Correct the rejected update using only the original results and criteria. "
+                        "Rejected update: " + memory.model_dump_json()
+                    )
+                }
+            )
+            memory = await self._planner.update_memory(context)
+            validate_memory(state, memory)
         has_progress = any(
             result.status == "success" and not result.additional_kwargs.get("reused", False)
             for result in state.pending_observations

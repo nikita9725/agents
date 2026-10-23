@@ -357,3 +357,65 @@ async def test_bad_observation_update_leaves_tools_checkpoint_intact(tmp_path: P
     )
     assert state.observations and not state.pending_observations
     assert len(state.tool_results) == 2 and state.stop_reason == "step_limit"
+
+
+@pytest.mark.parametrize("corrects_update", [True, False])
+async def test_memory_validation_correction_is_bounded_and_does_not_repeat_tools(
+    corrects_update: bool,
+) -> None:
+    calls = 0
+
+    @tool
+    def calculate() -> str:
+        """Calculate the demo result."""
+        nonlocal calls
+        calls += 1
+        return '{"result":4}'
+
+    class CorrectingPlanner(FakePlanner):
+        attempts = 0
+
+        async def create_plan(self, goal: str) -> ExecutionPlan:
+            return ExecutionPlan(
+                steps=["Calculate"], done_criteria=[DoneCriterion(description="Calculate")]
+            )
+
+        async def act(self, messages: list[AnyMessage]) -> AIMessage:
+            return AIMessage(
+                content="", tool_calls=[{"name": "calculate", "args": {}, "id": "calc"}]
+            )
+
+        async def update_memory(self, context: MemoryInput) -> WorkingMemory:
+            self.attempts += 1
+            if self.attempts == 1:
+                assert context.validation_feedback is None
+            else:
+                assert context.validation_feedback
+                assert "missing or unsuccessful evidence" in context.validation_feedback
+                assert "unknown_result" in context.validation_feedback
+            return WorkingMemory(
+                done_criteria=[
+                    DoneCriterion(
+                        description="Calculate",
+                        satisfied=True,
+                        evidence=[
+                            "result_1"
+                            if corrects_update and self.attempts == 2
+                            else "unknown_result"
+                        ],
+                    )
+                ]
+            )
+
+    planner = CorrectingPlanner()
+    graph = build_graph(planner, tools=[calculate])
+    if corrects_update:
+        state = AgentState.model_validate(await graph.ainvoke(RunInput(goal="Calculate")))
+        assert state.stop_reason == "criteria_met"
+        assert state.done_criteria[0].evidence == ["result_1"]
+        assert len(state.tool_results) == 1
+    else:
+        with pytest.raises(PlanningError, match="unsuccessful evidence"):
+            await graph.ainvoke(RunInput(goal="Calculate"))
+    assert planner.attempts == 2
+    assert calls == 1

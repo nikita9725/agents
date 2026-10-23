@@ -1,146 +1,166 @@
-# Агент диагностики ETL
+# ETL Diagnostic Agent
 
-Единственный публичный интерфейс — FastAPI API задач. LangGraph вызывает инструменты через настоящую LLM, анализирует observations
-и предлагает следующий шаг диагностики. Очередь, статусы и восстановление
-обеспечивает открытая библиотека DBOS с хранением в PostgreSQL.
-LangSmith и лицензия Agent Server для запуска не нужны.
+Учебный single-agent mini-product на **LangChain + LangGraph + LangSmith SDK**.
+Принимает цель диагностики ETL, составляет план, вызывает инструменты, обновляет
+рабочую память, проверяет критерии завершения и возвращает ответ с полным trace.
+FastAPI предоставляет постоянную очередь задач, чтение результата, SSE и отмену;
+DBOS и PostgreSQL обеспечивают сохранение и восстановление выполнения.
 
-```mermaid
-flowchart LR
-    subgraph app[Один процесс приложения]
-        api[FastAPI]
-        executor[DBOS executor]
-        graph[LangGraph: planning → acting → tools → observation]
-    end
-    client[Клиент: task_id] --> api
-    api --> db[(PostgreSQL: DBOS очередь и результаты)]
-    db --> executor
-    executor --> graph
-    graph --> llm[LLM]
-    graph --> checkpoints[(PostgreSQL: checkpoints)]
-    client -->|GET / SSE| api
-```
+## Быстрый запуск
 
-Агент читает локальные UTF-8-файлы, ищет текст и выполняет арифметические расчёты.
-Три инструмента оформлены через LangChain `@tool` и Pydantic. Файлы доступны только
-внутри `TOOL_FILES_ROOT` (по умолчанию `examples/tool_data`); изменения данных агент не выполняет.
-[Планирование, инструменты и примеры дня 4](docs/planning.md).
-
-## Запуск
-
-Нужны Docker, Docker Compose v2, uv и Python 3.13.
+Нужны Docker с Compose v2, uv и Python 3.13. Команды выполняются из корня проекта.
 
 ```sh
-cp .env.example .env
+cp .env.example .env  # только при первом запуске; существующий .env сохраняйте
 make setup
 ```
 
-Настройте `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` в `.env`.
-Для DeepSeek:
+В `.env` задайте `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`: нужна
+OpenAI-совместимая модель с tool calling и structured outputs. Для DeepSeek можно
+задать `LLM_EXTRA_BODY={"thinking":{"type":"disabled"}}`.
+
+```sh
+make up
+curl --fail http://127.0.0.1:8123/ready
+uv run --locked python examples/client.py 'Прочитай etl.log, затем calculator вычисли процент отклонённых строк.'
+```
+
+Готовность: `{"status":"ready"}`. Клиент печатает `task_id`, plan/action/tools/
+observation/finalization, изменения state и итоговый JSON с `final_answer`,
+`next_action`, `stop_reason`, памятью и `history`. Ожидаемый процент — **25%**.
+Swagger: http://127.0.0.1:8123/docs. `make logs` — логи, `make down` — остановка
+с сохранением данных. При другом `AGENT_PORT` передайте клиенту `--url`.
+
+Альтернатива для разработки: `make infra`, затем `make run` (Python на хосте).
+Перед переходом с Docker API выполните `make down`, затем `make infra`.
+Два приложения с одной БД и стабильным DBOS executor_id одновременно не запускайте.
+При изменении `POSTGRES_PORT` обновите порт в `TASK_DATABASE_URL` для запуска на хосте.
+
+## Что умеет агент
+
+| Tool | Вход | Результат и ограничения |
+|---|---|---|
+| `read_local_file` | `path` | UTF-8-файл внутри `TOOL_FILES_ROOT`, до 64 КиБ; `content`, `truncated` |
+| `text_search` | `path`, `query` | Буквальный поиск с учётом регистра, до 50 строк с номерами |
+| `calculator` | `expression` | Числа, скобки, `+ - * /`; конечное число, без исполнения Python |
+
+Tools оформлены через LangChain `@tool` и Pydantic-схемы. По умолчанию доступны
+учебные файлы `examples/tool_data`. Пути проверяются после разрешения symlink.
+Ошибки tools становятся observations со `status=error`; остальные вызовы пакета
+продолжают выполняться. [Контракты инструментов и настройки](docs/planning.md).
+
+## Граф и состояние
+
+```mermaid
+flowchart LR
+    START --> input --> planning --> acting
+    acting -->|tool calls| tools --> observation
+    observation -->|нужны данные| acting
+    acting -->|ответ или лимит| finalization
+    observation -->|критерии или остановка| finalization
+    finalization --> END
+```
+
+Planning создаёт `ExecutionPlan` и `done_criteria`. Acting выбирает tool calls
+по плану и текущей памяти. Tools сохраняет исходные результаты. Observation
+обновляет память через LLM; код проверяет ссылки на evidence и ограничения.
+Finalization формирует ответ, следующий шаг и объясняет причину остановки.
+
+Центральная Pydantic-модель `AgentState` содержит цель, план, сообщения, историю,
+`tool_results`, `observations`, `notes`, `done_criteria`, счётчики и итог.
+Acting получает компактную память и последний полный обмен с tools; полная история
+остаётся для аудита. Checkpoints LangGraph сохраняются в PostgreSQL после узлов;
+DBOS хранит очередь, статусы и итоговый state. Память изолирована по `task_id`.
+
+Остановка: `criteria_met`, `actor_finished`, `no_new_results`, `no_progress`
+или `step_limit`. По умолчанию разрешено 5 успешных выполнений acting; число
+вызовов tools в пакете может отличаться. Повторные одинаковые вызовы используют
+кеш задачи, два пакета без нового успешного результата останавливают цикл.
+LLM-узлы повторяют временные ошибки до трёх попыток по 30 секунд; общий дедлайн
+задачи после получения из очереди — 180 секунд. [Подробности графа](docs/graph.md).
+
+## Demo и полные traces
+
+Пять задач с ожидаемыми результатами и командами: **[demo](docs/demo.md)**.
+Машиночитаемые цели: [examples/goals.json](examples/goals.json).
+Два полных реальных запуска: [артефакты и разбор](examples/traces/README.md).
+
+API: `POST /tasks` → `202` с `task_id`; `GET /tasks/{task_id}` — статус/ответ;
+`GET /tasks/{task_id}/events` — SSE с последовательностью завершённых узлов;
+`POST /tasks/{task_id}/cancel` — отмена. Разрыв SSE не отменяет задачу.
+Полный trace доступен в `result.history` и `result.messages` после завершения.
+[Контракт API](docs/api.md).
+
+## LangSmith и локальная наблюдаемость
+
+LangSmith SDK подключён к LangGraph/LangChain; metadata связывает spans с
+`task_id`, `thread_id`, `request_id`. Восстановление создаёт новый `run_id` того же
+thread. В облаке доступны узлы, LLM, tools, ошибки, длительности и state updates.
 
 ```dotenv
-LLM_EXTRA_BODY={"thinking":{"type":"disabled"}}
+LANGSMITH_TRACING=true
+LANGSMITH_PROJECT=etl-agent
+LANGSMITH_API_KEY=<ваш ключ>
+LANGSMITH_ENDPOINT=https://api.smith.langchain.com
 ```
 
-```sh
-make infra # PostgreSQL в Docker, с ожиданием готовности
-make run   # Python на хосте, FastAPI и DBOS в одном процессе
-# или весь стек в Docker:
-make up    # запуск в фоне с ожиданием готовности
+После изменения настроек перезапустите приложение. По умолчанию
+`LANGSMITH_TRACING=false`: ключ и облачный сервис не нужны. Локальные SSE, history,
+checkpoints и структурированные логи доступны всегда. Тесты проверяют настоящий
+SDK через транспорт в памяти; это не подтверждение доставки в LangSmith.
+В финальной локальной приёмке облако отключено по выбору пользователя.
+[Трассировка, настройка и ошибки](docs/observability.md).
+
+## Структура
+
+```text
+src/etl_agent/
+  domain.py          # Pydantic: state, память, план и результаты
+  infrastructure/    # LangGraph, planner LangChain, tools, DBOS adapter
+  api.py, tasks.py    # FastAPI, контракт и сервис задач
+  runtime.py         # жизненный цикл PostgreSQL/DBOS
+  memory.py          # контекст, кеш, проверка evidence
+  observability.py   # логи и LangSmith
+  settings.py        # настройки окружения
+  client.py          # клиент API/SSE
+examples/            # клиент, пять целей, учебные данные, реальные traces
+tests/              # unit, integration, e2e
+docs/               # архитектура, API, demo и приёмка
 ```
 
-Пользовательские команды запуска определены в Makefile. `make infra` поднимает PostgreSQL;
-lifespan приложения автоматически инициализирует схемы DBOS и LangGraph при старте.
-FastAPI доступен на http://127.0.0.1:8123 (`AGENT_PORT`).
-Swagger: `/docs`, OpenAPI: `/openapi.json`, health: `/ok`, готовность БД: `/ready`.
-DBOS работает внутри процесса FastAPI. PostgreSQL публикуется только на localhost:
-`127.0.0.1:${POSTGRES_PORT:-5432}`. Локальный процесс читает `TASK_DATABASE_URL`
-из .env; контейнер API использует `postgres:5432`. При смене POSTGRES_PORT обновите
-порт в TASK_DATABASE_URL.
-
-Перед переходом с `make up` на `make run` выполните `make down`, затем
-`make infra`: оба приложения используют один порт и один DBOS executor_id,
-поэтому их нельзя запускать одновременно с общей БД. Данные сохраняются.
-Ctrl+C останавливает локальный API и исполнитель, PostgreSQL продолжает работать.
-Локальные логи выводятся в терминал; `make logs` показывает логи Docker.
-
-## Создание задачи
+## Проверки
 
 ```sh
-uv run --locked python examples/client.py 'Не загрузились продажи: нет sales.csv'
-```
-
-`POST /tasks` сохраняет задачу в постоянной очереди и возвращает `202` с `task_id`.
-`GET /tasks/{task_id}` возвращает статус и результат; `/cancel` прерывает задачу,
-`/events` отдаёт SSE завершённых узлов и итог. Клиент печатает trace `plan → action → observation → next action` через SSE,
-затем JSON результата. После каждого узла выводится `state Δ`: изменения памяти, новые/повторные результаты
-и причина остановки. Повторные действия сохраняются в порядке выполнения.
-Клиент использует только публичный task_id. [Контракт API](docs/api.md).
-
-## Надёжность
-
-DBOS сохраняет очередь, статус, дедлайн и результат в PostgreSQL. Исполнитель внутри процесса FastAPI
-обрабатывает до пяти задач одновременно. Docker автоматически перезапускает
-процесс после аварии в режиме `make up`. При локальном запуске повторите
-`make run` вручную. DBOS при старте восстанавливает незавершённые задачи своего
-стабильного executor_id. Сохранённые LangGraph checkpoints позволяют продолжить
-с незавершённого узла, сохранив task_id. Ручной POST или resume не требуется.
-
-Planning, acting, observation и finalization: до трёх попыток временных ошибок, по 30 секунд на попытку. Ошибки
-400/401/403 не повторяются. DBOS ограничивает выполнение задачи 180 секундами
-после получения из очереди; отмена прерывает асинхронный шаг.
-Бюджет `max_steps` по умолчанию — 5 успешных вызовов acting; начальный план и финализация выполняются отдельно.
-Если процесс умер до сохранения результата узла, LLM или read-only tools могут быть вызваны повторно.
-Перед обновлением графа завершите или отмените старые активные задачи; готовые результаты сохраняются.
-
-## Проверки и остановка
-
-```sh
-make unit-test         # без Docker, ключей и сети
-make integration-test  # PostgreSQL, настоящее приложение и LLM
+make unit-test         # без ключей, Docker и сети
+make integration-test  # настоящие LLM, PostgreSQL, FastAPI/DBOS
 make e2e-test          # SSE, отмена, очередь, SIGKILL и восстановление
-make test              # весь набор, без подмен в integration/e2e
-make lint
+make test              # весь набор последовательно
+make lint              # Ruff и mypy
 make pre-commit
-make logs
-make down              # volumes сохраняются
 ```
 
-Тестовый проект `etl-agent-test` имеет отдельный volume и порт 18123
-(`AGENT_TEST_PORT`), PostgreSQL — порт 15432 (`POSTGRES_TEST_PORT`). Наборы integration/e2e нельзя запускать одновременно.
-Текущие данные находятся в volume `etl-agent_task_data`. Старые volumes Agent
-Server и `agents_postgres_data` сохраняются; автоматической миграции задач из
-лицензируемого runtime нет. [Документация](docs/README.md).
+Integration/e2e используют отдельный Compose-проект `etl-agent-test`, volume и
+порты 18123/15432. Нужны Docker и действующие LLM-настройки; отсутствие ключа
+считается ошибкой, не skip. Эти наборы нельзя запускать одновременно.
+[Тестирование](docs/testing.md), [отчёт дня 7](docs/acceptance.md).
 
-## Рабочая память — день 4
+## Scope и ограничения
 
-AgentState содержит observations, tool_results, notes и done_criteria. Observation
-обновляет полезную выжимку через LLM, следующий actor использует её вместо всей
-переписки. Одинаковые вызовы инструментов получают сохранённый результат; при
-выполнении критериев или отсутствии новых данных граф завершает диагностику.
-Память и исходные результаты сохраняются в PostgreSQL checkpoints, итоговый state —
-в DBOS. Полная история остаётся для аудита. [Граф, лимиты и восстановление](docs/graph.md).
+Агент диагностирует предоставленные локальные ETL-данные и рекомендует следующий
+шаг. Он не исправляет файлы, не запускает pipeline, не подключается к источникам
+ETL, не ищет в интернете и не проверяет фактическое состояние внешних систем.
+Он не является production multi-agent платформой; аутентификация, multi-tenant
+изоляция и управление несколькими исполнителями не реализованы.
 
+Качество плана и ответа зависит от LLM. Проверка evidence подтверждает связь с
+результатом tool, но не доказывает правильность интерпретации моделью.
+`status=success` означает успешное выполнение workflow: критерии могут остаться
+невыполненными. Проверяйте `done_criteria`, `stop_reason` и ограничения ответа.
+Кеш действует в пределах задачи; содержимое изменившегося файла не перечитывается
+при тех же аргументах. История не ограничена как production-хранилище.
 
-## Guardrails — день 5
+После аварии незаписанный узел и его read-only calls могут выполниться повторно.
+Docker перезапускает API автоматически; при локальном запуске повторите `make run`.
+Перед изменением графа завершите или отмените активные задачи.
 
-Агент останавливается по критериям, решению actor, повторному пакету вызовов,
-лимиту шагов или после двух пакетов подряд без нового успешного результата
-(`no_progress`). Кеш предотвращает повторное исполнение, включая циклы A → B → A.
-Ошибки аргументов и исключения tools сохраняются как observations со status=error;
-агент может исправить вызов, а остальные tools пакета продолжают выполняться.
-Причина завершения видна в ответе, trace и логах; счётчик пакетов без прогресса
-сохраняется в checkpoints. [Правила остановки](docs/graph.md) и
-[проверяемые сценарии](docs/testing.md#день-5).
-
-
-## Наблюдаемость — день 6
-
-Граф пишет выбранные узлы и действия, вызовы tools, observations, краткие изменения
-состояния, попытки, длительности и ошибки. `task_id` связывает логи, SSE,
-checkpoints и LangSmith; при восстановлении создаётся новый `run_id`.
-
-LangSmith включается через `LANGSMITH_TRACING=true`, `LANGSMITH_PROJECT`,
-`LANGSMITH_API_KEY` и при необходимости `LANGSMITH_ENDPOINT` в `.env`.
-По умолчанию внешняя трассировка выключена. Ошибка доставки не меняет результат задачи.
-[Настройка, три сценария, схемы выполнения и failure modes](docs/observability.md#день-6).
+[Вся документация](docs/README.md).

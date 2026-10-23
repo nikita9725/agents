@@ -6,7 +6,14 @@ from dbos import EnqueueOptions
 from langchain_core.messages import AIMessage, AnyMessage
 
 from etl_agent.application import Planner
-from etl_agent.domain import ExecutionPlan, FinalResponse, NextAction
+from etl_agent.domain import (
+    ExecutionPlan,
+    FinalResponse,
+    MemoryInput,
+    NextAction,
+    Observation,
+    WorkingMemory,
+)
 from etl_agent.exceptions import PlanningError
 from etl_agent.infrastructure.task_executor import WorkflowRecord
 
@@ -28,6 +35,19 @@ class FakePlanner(Planner):
     async def create_plan(self, goal: str) -> ExecutionPlan:
         action = await self.propose(goal)
         return ExecutionPlan(steps=[action.action])
+
+    async def update_memory(self, context: MemoryInput) -> WorkingMemory:
+        return WorkingMemory(
+            observations=[
+                *context.observations,
+                *[
+                    Observation(summary=str(item.message.content)[:500], evidence=[item.id])
+                    for item in context.results
+                ],
+            ][-10:],
+            notes=context.notes,
+            done_criteria=context.done_criteria,
+        )
 
     async def act(self, messages: list[AnyMessage]) -> AIMessage:
         return AIMessage(content="Проверить входные данные по плану.")

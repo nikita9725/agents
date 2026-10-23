@@ -36,7 +36,7 @@ async def test_provider_receives_schemas_and_observation(tmp_path: Path) -> None
             assert body.choices[0].message.tool_calls
             body.choices[0].message.tool_calls[0].function.name = "ExecutionPlan"
         elif len(requests) == 2:
-            assert "Calculate rejected rows" in payload["messages"][-1]["content"]
+            assert any("Calculate rejected rows" in item["content"] for item in payload["messages"])
             assert {tool["function"]["name"] for tool in payload["tools"]} == {
                 "calculator",
                 "read_local_file",
@@ -46,6 +46,23 @@ async def test_provider_receives_schemas_and_observation(tmp_path: Path) -> None
             assert body.choices[0].message.tool_calls
             body.choices[0].message.tool_calls[0].function.name = "calculator"
         elif len(requests) == 3:
+            assert payload["tools"][0]["function"]["name"] == "WorkingMemory"
+            memory_input = json.loads(payload["messages"][-1]["content"])
+            assert memory_input["results"][0]["id"] == "result_1"
+            assert json.loads(memory_input["results"][0]["message"]["content"]) == {"result": 30.0}
+            body = completion(
+                json.dumps(
+                    {
+                        "observations": [{"summary": "30 rows rejected", "evidence": ["result_1"]}],
+                        "notes": ["30 rejected"],
+                        "done_criteria": [],
+                    }
+                )
+            )
+            assert body.choices[0].message.tool_calls
+            body.choices[0].message.tool_calls[0].function.name = "WorkingMemory"
+        elif len(requests) == 4:
+            assert "30 rejected" in payload["messages"][3]["content"]
             assert payload["messages"][-1]["role"] == "tool"
             assert payload["messages"][-1]["tool_call_id"] == "call_test"
             assert json.loads(payload["messages"][-1]["content"]) == {"result": 30.0}
@@ -86,7 +103,7 @@ async def test_provider_receives_schemas_and_observation(tmp_path: Path) -> None
         result = await build_graph(planner, tools=tools).ainvoke(
             RunInput(goal="Calculate rejected rows")
         )
-    assert len(requests) == 4
+    assert len(requests) == 5
     assert result["final_answer"] == "30 rows rejected"
 
 

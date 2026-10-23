@@ -78,6 +78,7 @@ async def test_observations_loop_serialization_and_logging(
         "input",
         "planning",
         "acting",
+        "tools",
         "observation",
         "observation",
         "acting",
@@ -287,14 +288,16 @@ async def test_plan_read_observation_then_dependent_calculation(tmp_path: Path) 
         "input",
         "planning",
         "acting",
+        "tools",
         "observation",
         "acting",
+        "tools",
         "observation",
         "acting",
         "finalization",
     ]
     assert '"name": "read_local_file"' in state.history[2].content
-    assert '"name": "calculator"' in state.history[4].content
+    assert '"name": "calculator"' in state.history[5].content
 
 
 async def test_actor_retry_does_not_repeat_plan_or_duplicate_history() -> None:

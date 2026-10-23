@@ -34,7 +34,12 @@ def test_client_prints_repeated_actions_and_deduplicates_replay(
     history = [
         HistoryEntry(role="assistant", node="planning", content="Read then calculate"),
         HistoryEntry(role="assistant", node="acting", content="Read log"),
-        HistoryEntry(role="tool", node="observation", content="120 total, 30 rejected"),
+        HistoryEntry(
+            role="tool",
+            node="observation",
+            content="120 total, 30 rejected",
+            state_delta={"notes": ["expected=120 rejected=30"]},
+        ),
         HistoryEntry(role="assistant", node="acting", content="Calculate 30/120*100"),
     ]
     progress = [
@@ -66,6 +71,8 @@ def test_client_prints_repeated_actions_and_deduplicates_replay(
     assert output.count("action:") == 2
     assert output.index("plan:") < output.index("Read log") < output.index("observation:")
     assert output.count("Read log") == 1
+    assert output.count("state Δ:") == 1
+    assert '"notes": ["expected=120 rejected=30"]' in output
 
 
 @pytest.mark.parametrize("case", ["error", "disconnect", "timeout"])

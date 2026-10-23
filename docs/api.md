@@ -14,7 +14,8 @@ curl -X POST http://127.0.0.1:8123/tasks \
 `goal` — непустой текст; `max_steps` — положительное целое, по умолчанию 5.
 Бюджет ограничивает успешные вызовы acting, а не число отдельных tools.
 Последний набор tools выполняется, после чего агент формирует ответ с отметкой
-об исчерпании бюджета. Начальное планирование и финализация в этот бюджет не входят.
+об исчерпании бюджета. Начальное планирование, обновление памяти и финализация в этот бюджет не входят.
+Если на последнем шаге выполнены критерии, причина завершения — criteria_met.
 Лишние поля запрещены. Ответ `202 Accepted` и `Location: /tasks/{task_id}`
 означают, что фоновая работа создана; ответ модели ещё не требуется.
 
@@ -53,8 +54,7 @@ data: {"task_id":"46d34898-1d45-4bc4-a2fd-0682984b60dd","status":"success","resu
 ```
 
 В примере `result` сокращён; его реальная схема совпадает с GET задачи.
-`progress.node`: `input`, `planning`, `acting`, `observation`, `finalization`;
-для старых результатов допустимо `tools`. `role` и `content` совпадают с записью
+`progress.node`: `input`, `planning`, `acting`, `tools`, `observation`, `finalization`. `role` и `content` совпадают с записью
 `result.history`. `sequence` — порядковый номер записи начиная с 1.
 События строятся по сохранённой истории с опросом раз в 200 мс: это завершённые
 записи trace, не токены LLM. Tools сохраняет результат в checkpoint, observation
@@ -90,3 +90,23 @@ status и соответствующий tool_call_id. `result.history` допу
 по наблюдениям. `result.plan.steps` содержит начальный краткий план; `pending_observations` пуст
 после успешного завершения. Trace `planning → acting → observation → acting`
 сохраняется в истории и передаётся через SSE без удаления повторных узлов.
+
+## Рабочая память и изменения состояния
+
+`result.observations` содержит краткие наблюдения `{summary, evidence}`;
+`result.notes` — полезную выжимку; `result.done_criteria` — критерии
+`{description, satisfied, evidence}`. Evidence ссылается на `result.tool_results[].id`.
+Каждый ToolResult содержит `id`, `name`, `args`, `message` (исходный ToolMessage).
+Повторные вызовы используют сохранённый результат, но получают свой tool_call_id.
+`result.last_batch_new_results` показывает число новых результатов последнего пакета.
+`result.stop_reason`: criteria_met, no_new_results, step_limit или actor_finished.
+
+`HistoryEntry` и SSE `progress` содержат необязательный `state_delta` (null у
+старых записей). Последняя запись каждого узла содержит его изменения state:
+например `{"notes":["expected_rows=120, rejected_rows=30"],"pending_observations":0}`.
+Tools сообщает `new_result_ids` и `reused_result_ids`. Полные файлы и архив переписки
+в delta не копируются. Клиент печатает delta рядом с текстом узла.
+
+Память и результаты сохраняются в PostgreSQL checkpoints, итоговый state — в DBOS.
+Новые поля старых завершённых результатов по умолчанию пусты. Ограничения памяти
+относятся к контексту LLM; полный архив результатов остаётся доступен в result.

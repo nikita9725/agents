@@ -138,7 +138,7 @@ async def test_resume_saved_tool_boundary_without_reexecution(boundary: str) -> 
 
     @tool
     def calculator(expression: str) -> str:
-        """Count actual tool executions."""
+        """Подсчитывать фактические выполнения инструмента."""
         nonlocal calls
         calls += 1
         return '{"result":30}'
@@ -170,14 +170,25 @@ async def test_resume_saved_tool_boundary_without_reexecution(boundary: str) -> 
     assert result["plan"].steps
 
 
-async def test_unexpected_tool_bug_propagates() -> None:
+async def test_unexpected_tool_bug_becomes_safe_observation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     @tool
     def calculator(expression: str) -> str:
-        """Broken tool for failure propagation."""
+        """Вызывать исключение для проверки его преобразования в безопасный результат ошибки."""
         raise RuntimeError("implementation bug")
 
-    with pytest.raises(RuntimeError, match="implementation bug"):
-        await build_graph(ToolPlanner(), tools=[calculator]).ainvoke(RunInput(goal="Inspect"))
+    with caplog.at_level(logging.INFO):
+        result = await build_graph(ToolPlanner(), tools=[calculator]).ainvoke(
+            RunInput(goal="Inspect")
+        )
+    state = AgentState.model_validate(result)
+    failed = state.tool_results[0]
+    assert failed.message.status == "error"
+    assert failed.message.tool_call_id == "calc_1" and failed.message.name == "calculator"
+    assert "implementation bug" not in state.model_dump_json()
+    assert "implementation bug" in caplog.text and "event=tool.failed" in caplog.text
+    assert state.stop_reason == "actor_finished" and state.final_answer
 
 
 async def test_finalization_retries_without_repeating_tools(tmp_path: Path) -> None:
@@ -215,6 +226,7 @@ def test_old_completed_result_remains_readable() -> None:
     )
     assert state.messages == [] and state.final_answer
     assert state.plan is None and state.pending_observations == []
+    assert state.consecutive_no_progress == 0
 
 
 async def test_plan_read_observation_then_dependent_calculation(tmp_path: Path) -> None:

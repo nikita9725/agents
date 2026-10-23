@@ -11,7 +11,3 @@ class TransientPlanningError(PlanningError):
 
 class PlanningTimeout(PlanningError):
     """Истекло время попытки вызова модели."""
-
-
-class StepLimitExceeded(Exception):
-    """Исчерпан бюджет шагов; повтор не поможет."""

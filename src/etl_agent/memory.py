@@ -41,6 +41,28 @@ def validate_memory(state: AgentState, memory: WorkingMemory) -> None:
             raise PlanningError("Satisfied criterion requires evidence")
 
 
+def reject_failed_evidence(state: AgentState, memory: WorkingMemory) -> WorkingMemory:
+    """A failed tool cannot satisfy a criterion, even when the LLM claims it can."""
+    failed = {result.id for result in state.tool_results if result.message.status == "error"}
+    return memory.model_copy(
+        update={
+            "done_criteria": [
+                item.model_copy(
+                    update={
+                        "satisfied": False,
+                        "evidence": [
+                            reference for reference in item.evidence if reference not in failed
+                        ],
+                    }
+                )
+                if failed.intersection(item.evidence)
+                else item
+                for item in memory.done_criteria
+            ]
+        }
+    )
+
+
 def model_context(state: AgentState) -> list[AnyMessage]:
     """Keep the last complete tool exchange; archive messages never become model memory."""
     memory = WorkingMemory(

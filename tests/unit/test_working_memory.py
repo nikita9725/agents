@@ -25,6 +25,7 @@ from etl_agent.domain import (
 from etl_agent.exceptions import PlanningError, TransientPlanningError
 from etl_agent.infrastructure.graph import build_graph
 from etl_agent.infrastructure.tools import create_tools
+from etl_agent.memory import reject_failed_evidence, validate_memory
 from tests.fakes import FakePlanner
 from tests.unit.test_agent import fast_retries
 from tests.unit.test_tool_graph import ToolPlanner
@@ -237,7 +238,7 @@ async def test_observation_retry_does_not_repeat_tools_or_history(tmp_path: Path
     assert len([item for item in state.history if item.node == "observation"]) == 3
 
 
-@pytest.mark.parametrize("invalid", ["unknown", "failed", "empty", "changed"])
+@pytest.mark.parametrize("invalid", ["unknown", "empty", "changed"])
 async def test_invalid_criterion_evidence_is_rejected(invalid: str, tmp_path: Path) -> None:
     class InvalidMemory(FakePlanner):
         async def create_plan(self, goal: str) -> ExecutionPlan:
@@ -419,3 +420,46 @@ async def test_memory_validation_correction_is_bounded_and_does_not_repeat_tools
             await graph.ainvoke(RunInput(goal="Calculate"))
     assert planner.attempts == 2
     assert calls == 1
+
+
+@pytest.mark.parametrize("satisfied", [True, False])
+def test_failed_evidence_is_removed_and_criterion_remains_unconfirmed(satisfied: bool) -> None:
+    from etl_agent.domain import ToolResult
+
+    state = AgentState(
+        goal="Read and calculate",
+        done_criteria=[DoneCriterion(description="Read")],
+        tool_results=[
+            ToolResult(
+                id="result_1",
+                name="calculator",
+                args={},
+                message=ToolMessage(content="4", tool_call_id="calc", status="success"),
+            ),
+            ToolResult(
+                id="result_2",
+                name="read_local_file",
+                args={},
+                message=ToolMessage(content="File not found", tool_call_id="read", status="error"),
+            ),
+        ],
+    )
+    memory = WorkingMemory(
+        observations=[Observation(summary="File unavailable", evidence=["result_2"])],
+        done_criteria=[
+            DoneCriterion(
+                description="Read", satisfied=satisfied, evidence=["result_1", "result_2"]
+            )
+        ],
+    )
+    corrected = reject_failed_evidence(state, memory)
+    validate_memory(state, corrected)
+    assert not corrected.done_criteria[0].satisfied
+    assert corrected.done_criteria[0].evidence == ["result_1"]
+    assert corrected.observations == memory.observations
+    assert memory.done_criteria[0].evidence == ["result_1", "result_2"]
+    unknown = corrected.model_copy(
+        update={"done_criteria": [DoneCriterion(description="Read", evidence=["unknown"])]}
+    )
+    with pytest.raises(PlanningError, match="unsuccessful evidence"):
+        validate_memory(state, reject_failed_evidence(state, unknown))

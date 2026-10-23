@@ -32,7 +32,13 @@ from etl_agent.domain import (
 )
 from etl_agent.exceptions import PlanningError, PlanningTimeout, TransientPlanningError
 from etl_agent.infrastructure.tools import ToolError, create_tools
-from etl_agent.memory import call_key, memory_input, model_context, validate_memory
+from etl_agent.memory import (
+    call_key,
+    memory_input,
+    model_context,
+    reject_failed_evidence,
+    validate_memory,
+)
 from etl_agent.observability import node_context, observed_node, tool_log_payload
 
 logger = logging.getLogger(__name__)
@@ -307,7 +313,7 @@ class Nodes:
 
     async def observation(self, state: AgentState, runtime: Runtime[None]) -> ObservationUpdate:
         context = memory_input(state)
-        memory = await self._planner.update_memory(context)
+        memory = reject_failed_evidence(state, await self._planner.update_memory(context))
         try:
             validate_memory(state, memory)
         except PlanningError as error:
@@ -322,7 +328,7 @@ class Nodes:
                     )
                 }
             )
-            memory = await self._planner.update_memory(context)
+            memory = reject_failed_evidence(state, await self._planner.update_memory(context))
             validate_memory(state, memory)
         has_progress = any(
             result.status == "success" and not result.additional_kwargs.get("reused", False)

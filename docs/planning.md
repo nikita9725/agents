@@ -1,4 +1,4 @@
-# Планирование и инструменты — agents_day03
+# Планирование и инструменты — agents_day04
 
 Агент использует настоящий OpenAI-совместимый провайдер через LangChain.
 `Planner.create_plan(goal)` возвращает `ExecutionPlan` с непустым списком `steps`.
@@ -7,7 +7,8 @@ Planner видит цель и описания доступных инстру�
 и как текстовое сообщение в переписке для actor.
 
 `Planner.act(messages)` возвращает AIMessage с текстом или tool calls.
-Actor следует плану, учитывает observations и адаптирует действия без отдельного
+Actor получает план, рабочую память и последний полный обмен с tools;
+учитывает observations/notes/done_criteria и адаптирует действия без отдельного
 перепланирования. Зависимые вызовы должны выполняться на разных шагах.
 `Planner.finalize(messages)` возвращает FinalResponse с `final_answer` и
 `next_action` (`action`, `rationale`). Метод `propose(goal)` сохранён как
@@ -151,3 +152,26 @@ Tools сохраняет сырые результаты в checkpoint; observat
 
 В реальном выводе action содержит JSON tool calls, observation — JSON ToolMessage,
 включая исходный tool_call_id и status. Полный сценарий описан в [графе](graph.md).
+
+## Рабочая память дня 4
+
+`Planner.update_memory(MemoryInput)` выполняется в observation и возвращает
+WorkingMemory с observations, notes и done_criteria. Критерии первоначально
+формируются вместе с ExecutionPlan. [Правила памяти и остановки](graph.md).
+
+```sh
+uv run --locked python examples/client.py 'Прочитай etl.log через read_local_file. После чтения вычисли calculator процент rejected_rows от expected_rows. Укажи процент и ошибку из лога.'
+```
+
+Ожидаемый ход (точные формулировки LLM могут отличаться):
+
+1. planning сохраняет план и невыполненные критерии.
+2. tools сохраняет result_1 с содержимым etl.log.
+3. observation выделяет expected_rows=120, rejected_rows=30 и ошибку в notes/observations.
+4. acting использует сохранённые числа и вызывает calculator.
+5. observation сохраняет 25%, подтверждает критерии evidence из result_1/result_2.
+6. finalization отвечает по памяти; trace показывает state Δ после каждого узла.
+
+Одинаковый повторный вызов получает сохранённый результат. Если весь очередной
+пакет повторяет предыдущие вызовы, агент завершает цикл с объяснением отсутствия
+новых данных вместо расходования оставшегося бюджета.

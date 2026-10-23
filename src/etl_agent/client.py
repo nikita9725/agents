@@ -26,6 +26,11 @@ def stream_task(client: httpx.Client, task_id: UUID, *, timeout: float = 300) ->
                 seen.add(progress.sequence)
                 label = {"planning": "plan", "acting": "action"}.get(progress.node, progress.node)
                 print(f"[{progress.sequence}] {label}: {progress.content}", flush=True)
+                if progress.state_delta is not None:
+                    print(
+                        "  state Δ: " + json.dumps(progress.state_delta, ensure_ascii=False),
+                        flush=True,
+                    )
             elif event == "error":
                 error = TaskStreamError.model_validate_json(data)
                 raise RuntimeError(error.error.message)

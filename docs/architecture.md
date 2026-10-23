@@ -5,7 +5,7 @@
 - DBOSTasks — адаптер очереди и статусов DBOS, чтение checkpoints.
 - DBOS worker — постоянная очередь PostgreSQL, конкурентность и восстановление.
 - LangGraph — граф input → planning → acting → tools → observation → acting/finalization, native retry/timeout policies.
-- OpenAIPlanner — настоящий провайдер, структурированный план, tool calling, structured finalization и классификация ошибок.
+- OpenAIPlanner — настоящий провайдер, структурированный план, tool calling, обновление рабочей памяти, structured finalization и классификация ошибок.
 
 ## Постоянное исполнение
 
@@ -56,3 +56,12 @@ PostgreSQL в Docker. Локальный и контейнерный API не з
 Отдельного сервиса worker и административного HTTP-порта DBOS больше нет.
 Имена workflow, step, очереди, executor и версия сохранены; миграция таблиц
 и удаление volume не требуются.
+
+## Рабочая память
+
+State содержит компактные observations/notes/done_criteria и архив tool_results.
+Observation обновляет выжимку через LLM, код проверяет лимиты и ссылки на evidence.
+Acting/finalization получают цель, план, выжимку и последний полный цикл tools.
+Полная переписка хранится для аудита. Повторные одинаковые вызовы используют кеш
+одной задачи; подтверждённые критерии и отсутствие новых результатов влияют на
+маршрутизацию графа. [Подробные правила и ограничения](graph.md).

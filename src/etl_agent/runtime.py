@@ -36,6 +36,9 @@ class RuntimeSettings(BaseSettings):
 async def checkpoints(settings: RuntimeSettings) -> AsyncIterator[AsyncPostgresSaver]:
     allowed = [
         ("etl_agent.domain", "ExecutionPlan"),
+        ("etl_agent.domain", "DoneCriterion"),
+        ("etl_agent.domain", "Observation"),
+        ("etl_agent.domain", "ToolResult"),
         ("etl_agent.domain", "HistoryEntry"),
         ("etl_agent.domain", "NextAction"),
         ("etl_agent.domain", "RunInput"),

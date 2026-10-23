@@ -32,8 +32,9 @@ def ready(stack: Stack, *, timeout: float = 90) -> None:
 def test_result_survives_container_recreation(
     agent_stack: Stack, agent_client: httpx.Client
 ) -> None:
-    task_id = submit(agent_client, "Учебная задача: не найден файл sales.csv")
+    task_id = submit(agent_client, "Используй calculator: вычисли (120-90)/120*100")
     original = successful_state(agent_client, task_id)
+    assert original.tool_results and original.observations and original.done_criteria
     agent_stack.execute("recreate-api")
     ready(agent_stack)
     saved = Task.model_validate(agent_client.get(f"/tasks/{task_id}").json())
@@ -52,13 +53,22 @@ def test_public_streaming(agent_client: httpx.Client) -> None:
         "input",
         "planning",
         "acting",
+        "tools",
         "observation",
         "finalization",
     }
     progress = [entry for entry in data if "node" in entry]
     assert [entry["sequence"] for entry in progress] == list(range(1, len(progress) + 1))
     assert all(entry["content"] and entry["role"] for entry in progress)
-    assert sum(entry["node"] == "acting" for entry in progress) >= 2
+    assert sum(entry["node"] == "acting" for entry in progress) >= 1
+    assert {entry["node"] for entry in progress if entry.get("state_delta") is not None} == {
+        "input",
+        "planning",
+        "acting",
+        "tools",
+        "observation",
+        "finalization",
+    }
     result = successful_state(agent_client, task_id)
     assert [entry["node"] for entry in progress] == [entry.node for entry in result.history]
     assert any(entry.get("status") == "success" for entry in data), data
@@ -248,3 +258,13 @@ def test_full_graph_reads_searches_and_calculates(agent_client: httpx.Client) ->
     assert any(value == pytest.approx(25.0) for value in percentages), state.final_answer
     assert state.next_action is not None
     assert state.next_action.action.strip() and state.next_action.rationale.strip()
+
+    assert state.notes and state.observations and state.done_criteria
+    assert state.stop_reason is not None
+    successful = {result.id for result in state.tool_results if result.message.status == "success"}
+    assert successful
+    for criterion in state.done_criteria:
+        if criterion.satisfied:
+            assert criterion.evidence and set(criterion.evidence) <= successful
+    delta_nodes = {entry.node for entry in state.history if entry.state_delta is not None}
+    assert delta_nodes == {"input", "planning", "acting", "tools", "observation", "finalization"}

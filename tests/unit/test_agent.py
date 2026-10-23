@@ -40,7 +40,12 @@ async def test_graph_preserves_history_and_checkpoints() -> None:
     result = await graph.ainvoke(RunInput(goal="missing file"), run_config, durability="sync")
     assert result["current_step"] == 1
     assert result["final_answer"]
-    assert [item.node for item in result["history"]] == ["input", "planning", "finalization"]
+    assert [item.node for item in result["history"]] == [
+        "input",
+        "planning",
+        "acting",
+        "finalization",
+    ]
     assert planner.calls == ["missing file"]
     assert len([item async for item in graph.aget_state_history(run_config)]) >= 3
 
@@ -71,7 +76,7 @@ async def test_transient_error_retries_without_duplicating_history() -> None:
     )
     assert planner.attempts == 3
     assert result["current_step"] == 1
-    assert len(result["history"]) == 3
+    assert len(result["history"]) == 4
 
 
 async def test_retries_are_bounded_and_permanent_failure_is_not_retried() -> None:

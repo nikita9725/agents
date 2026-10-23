@@ -13,7 +13,6 @@ from etl_agent.infrastructure.task_executor import DBOSTasks
 from etl_agent.runtime import RuntimeSettings
 from etl_agent.tasks import (
     ExecutorUnavailable,
-    NodeName,
     Task,
     TaskError,
     TaskNotFound,
@@ -80,9 +79,13 @@ class FakeExecutor:
             self.status = "interrupted"
         return await self.get(task_id)
 
-    async def completed_nodes(self, task_id: UUID) -> list[NodeName]:
+    async def history(self, task_id: UUID) -> list[HistoryEntry]:
         await self.ready()
-        return ["input", "planning", "finalization"] if self.status == "success" else []
+        if self.status != "success":
+            return []
+        task = await self.get(task_id)
+        assert task.result is not None
+        return task.result.history
 
 
 @asynccontextmanager
@@ -300,3 +303,61 @@ async def test_dbos_enqueue_failure_is_not_retried() -> None:
             RunInput(goal="file missing")
         )
     assert client.enqueue_attempts == 1
+
+
+async def test_sse_keeps_repeated_nodes_and_stable_sequences() -> None:
+    entries = [
+        HistoryEntry(role="assistant", node="planning", content="Read then calculate"),
+        HistoryEntry(role="assistant", node="acting", content="Read file"),
+        HistoryEntry(role="tool", node="observation", content="120 rows, 30 rejected"),
+        HistoryEntry(role="assistant", node="acting", content="Calculate percentage"),
+        HistoryEntry(role="tool", node="observation", content="25%"),
+        HistoryEntry(role="assistant", node="finalization", content="Rejected 25%"),
+    ]
+
+    class GrowingExecutor(FakeExecutor):
+        polls = 0
+
+        async def history(self, task_id: UUID) -> list[HistoryEntry]:
+            self.polls += 1
+            # Include an unchanged poll to exercise deduplication, then complete.
+            return entries[:2] if self.polls <= 2 else entries
+
+        async def get(self, task_id: UUID) -> Task:
+            if self.polls >= 3:
+                self.status = "success"
+            task = await super().get(task_id)
+            if task.result is not None:
+                task.result.history = entries
+            return task
+
+    executor = GrowingExecutor()
+    executor.status = "running"
+    service = TaskService(executor)
+    initial = await service.get(executor.task_id)
+    events = [event async for event in service.events(initial)]
+    progress = [event.data for event in events if event.event == "progress"]
+    from etl_agent.tasks import TaskProgress
+
+    assert all(isinstance(item, TaskProgress) for item in progress)
+    assert [item.sequence for item in progress if isinstance(item, TaskProgress)] == list(
+        range(1, 7)
+    )
+    assert [item.node for item in progress if isinstance(item, TaskProgress)] == [
+        entry.node for entry in entries
+    ]
+    replay = [event async for event in service.events(await service.get(executor.task_id))]
+    assert [item.data for item in replay if item.event == "progress"] == progress
+
+
+async def test_sse_includes_final_history_when_checkpoint_read_lags() -> None:
+    class LaggingExecutor(FakeExecutor):
+        async def history(self, task_id: UUID) -> list[HistoryEntry]:
+            return []
+
+    executor = LaggingExecutor()
+    executor.status = "success"
+    service = TaskService(executor)
+    task = await service.get(executor.task_id)
+    events = [event async for event in service.events(task)]
+    assert [event.event for event in events] == ["progress", "progress", "progress", "task"]

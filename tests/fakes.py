@@ -6,7 +6,7 @@ from dbos import EnqueueOptions
 from langchain_core.messages import AIMessage, AnyMessage
 
 from etl_agent.application import Planner
-from etl_agent.domain import FinalResponse, NextAction
+from etl_agent.domain import ExecutionPlan, FinalResponse, NextAction
 from etl_agent.exceptions import PlanningError
 from etl_agent.infrastructure.task_executor import WorkflowRecord
 
@@ -25,9 +25,12 @@ class FakePlanner(Planner):
             action = "Проверить наличие входного файла для указанного запуска ETL."
         return NextAction(action=action, rationale=f"Сначала нужно проверить сведения: {goal}")
 
-    async def plan(self, messages: list[AnyMessage]) -> AIMessage:
-        action = await self.propose(str(messages[0].content))
-        return AIMessage(content=f"{action.action}\n{action.rationale}")
+    async def create_plan(self, goal: str) -> ExecutionPlan:
+        action = await self.propose(goal)
+        return ExecutionPlan(steps=[action.action])
+
+    async def act(self, messages: list[AnyMessage]) -> AIMessage:
+        return AIMessage(content="Проверить входные данные по плану.")
 
     async def finalize(self, messages: list[AnyMessage]) -> FinalResponse:
         return FinalResponse(

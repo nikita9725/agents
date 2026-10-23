@@ -24,7 +24,7 @@ class ToolPlanner(FakePlanner):
         self.final_inputs: list[AnyMessage] = []
         self.repeat = repeat
 
-    async def plan(self, messages: list[AnyMessage]) -> AIMessage:
+    async def act(self, messages: list[AnyMessage]) -> AIMessage:
         self.inputs.append(list(messages))
         if len(self.inputs) == 1 or self.repeat:
             return AIMessage(
@@ -77,9 +77,10 @@ async def test_observations_loop_serialization_and_logging(
     assert [entry.node for entry in state.history] == [
         "input",
         "planning",
-        "tools",
-        "tools",
-        "planning",
+        "acting",
+        "observation",
+        "observation",
+        "acting",
         "finalization",
     ]
 
@@ -98,7 +99,7 @@ async def test_budget_executes_last_calls_and_finalizes(tmp_path: Path) -> None:
 
 async def test_bad_arguments_and_unknown_tool_can_be_corrected(tmp_path: Path) -> None:
     class CorrectingPlanner(ToolPlanner):
-        async def plan(self, messages: list[AnyMessage]) -> AIMessage:
+        async def act(self, messages: list[AnyMessage]) -> AIMessage:
             self.inputs.append(list(messages))
             if len(self.inputs) == 1:
                 return AIMessage(
@@ -130,7 +131,7 @@ async def test_bad_arguments_and_unknown_tool_can_be_corrected(tmp_path: Path) -
     assert result["current_step"] == 3
 
 
-@pytest.mark.parametrize("boundary", ["planning", "tools"])
+@pytest.mark.parametrize("boundary", ["planning", "acting", "tools", "observation"])
 async def test_resume_saved_tool_boundary_without_reexecution(boundary: str) -> None:
     calls = 0
 
@@ -147,12 +148,25 @@ async def test_resume_saved_tool_boundary_without_reexecution(boundary: str) -> 
     graph = build_graph(planner, tools=tools, checkpointer=saver)
     config: RunnableConfig = {"configurable": {"thread_id": str(uuid4())}}
     await graph.ainvoke(RunInput(goal="Inspect"), config, interrupt_after=[boundary])
-    assert calls == (0 if boundary == "planning" else 1)
+    assert calls == (0 if boundary in {"planning", "acting"} else 1)
     snapshot = await graph.aget_state(config)
-    assert snapshot.next == (("tools",) if boundary == "planning" else ("planning",))
+    expected_next = {
+        "planning": "acting",
+        "acting": "tools",
+        "tools": "observation",
+        "observation": "acting",
+    }
+    assert snapshot.next == (expected_next[boundary],)
+    if boundary == "tools":
+        assert len(snapshot.values["pending_observations"]) == 2
+        assert not any(isinstance(message, ToolMessage) for message in snapshot.values["messages"])
+    if boundary == "observation":
+        assert snapshot.values["pending_observations"] == []
     restored = build_graph(planner, tools=tools, checkpointer=saver)
     result = await restored.ainvoke(None, config)
     assert result["final_answer"] and calls == 1
+    assert planner.calls == ["Inspect"]
+    assert result["plan"].steps
 
 
 async def test_unexpected_tool_bug_propagates() -> None:
@@ -183,7 +197,7 @@ async def test_finalization_retries_without_repeating_tools(tmp_path: Path) -> N
         planner, tools=create_tools(tmp_path), retry_policy=fast_retries()
     ).ainvoke(RunInput(goal="Inspect"))
     assert planner.attempts == 2 and len(planner.inputs) == 2
-    assert len([entry for entry in result["history"] if entry.node == "tools"]) == 2
+    assert len([entry for entry in result["history"] if entry.node == "observation"]) == 2
     assert len([entry for entry in result["history"] if entry.node == "finalization"]) == 1
 
 
@@ -199,3 +213,115 @@ def test_old_completed_result_remains_readable() -> None:
         }
     )
     assert state.messages == [] and state.final_answer
+    assert state.plan is None and state.pending_observations == []
+
+
+async def test_plan_read_observation_then_dependent_calculation(tmp_path: Path) -> None:
+    from etl_agent.domain import ExecutionPlan
+
+    (tmp_path / "etl.log").write_text("expected_rows=120 rejected_rows=30")
+
+    class SequentialPlanner(ToolPlanner):
+        plans = 0
+
+        async def create_plan(self, goal: str) -> ExecutionPlan:
+            self.plans += 1
+            return ExecutionPlan(steps=["Прочитать etl.log", "Вычислить процент отклонений"])
+
+        async def act(self, messages: list[AnyMessage]) -> AIMessage:
+            self.inputs.append(list(messages))
+            assert "Вычислить процент отклонений" in str(messages[1].content)
+            if len(self.inputs) == 1:
+                return AIMessage(
+                    content="Читаю исходные числа",
+                    tool_calls=[
+                        {
+                            "name": "read_local_file",
+                            "args": {"path": "etl.log"},
+                            "id": "read",
+                        }
+                    ],
+                )
+            if len(self.inputs) == 2:
+                observation = messages[-1]
+                assert isinstance(observation, ToolMessage)
+                content = json.loads(str(observation.content))["content"]
+                counts = dict(item.split("=") for item in content.split())
+                return AIMessage(
+                    content="Считаю по полученным данным",
+                    tool_calls=[
+                        {
+                            "name": "calculator",
+                            "id": "calc",
+                            "args": {
+                                "expression": f"{counts['rejected_rows']}/{counts['expected_rows']}*100"
+                            },
+                        }
+                    ],
+                )
+            assert isinstance(messages[-1], ToolMessage)
+            assert json.loads(str(messages[-1].content))["result"] == 25
+            return AIMessage(content="25%")
+
+        async def finalize(self, messages: list[AnyMessage]) -> FinalResponse:
+            return FinalResponse(
+                final_answer="Отклонено 25%",
+                next_action=NextAction(
+                    action="Проверить отклонённые строки",
+                    rationale="Отклонено 25%",
+                ),
+            )
+
+    planner = SequentialPlanner()
+    state = AgentState.model_validate(
+        await build_graph(
+            planner,
+            tools=create_tools(tmp_path),
+        ).ainvoke(RunInput(goal="Прочитай лог и вычисли процент"))
+    )
+    assert planner.plans == 1
+    assert state.plan and len(state.plan.steps) == 2
+    assert state.pending_observations == []
+    assert state.final_answer == "Отклонено 25%"
+    assert [entry.node for entry in state.history] == [
+        "input",
+        "planning",
+        "acting",
+        "observation",
+        "acting",
+        "observation",
+        "acting",
+        "finalization",
+    ]
+    assert '"name": "read_local_file"' in state.history[2].content
+    assert '"name": "calculator"' in state.history[4].content
+
+
+async def test_actor_retry_does_not_repeat_plan_or_duplicate_history() -> None:
+    from etl_agent.exceptions import TransientPlanningError
+    from tests.unit.test_agent import fast_retries
+
+    class RetryingActor(FakePlanner):
+        attempts = 0
+
+        async def act(self, messages: list[AnyMessage]) -> AIMessage:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise TransientPlanningError("busy")
+            return await super().act(messages)
+
+    planner = RetryingActor()
+    state = AgentState.model_validate(
+        await build_graph(
+            planner,
+            retry_policy=fast_retries(),
+        ).ainvoke(RunInput(goal="Inspect"))
+    )
+    assert planner.calls == ["Inspect"]
+    assert planner.attempts == 2 and state.current_step == 1
+    assert [entry.node for entry in state.history] == [
+        "input",
+        "planning",
+        "acting",
+        "finalization",
+    ]

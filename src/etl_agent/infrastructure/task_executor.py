@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from etl_agent.domain import AgentState, HistoryEntry, RunInput
 from etl_agent.observability import request_id
 from etl_agent.runtime import QUEUE_NAME, WORKFLOW_NAME, RuntimeSettings, checkpoints
-from etl_agent.tasks import ExecutorUnavailable, NodeName, Task, TaskError, TaskNotFound, TaskStatus
+from etl_agent.tasks import ExecutorUnavailable, Task, TaskError, TaskNotFound, TaskStatus
 
 logger = logging.getLogger(__name__)
 STATUS_MAP: dict[str, TaskStatus] = {
@@ -145,7 +145,7 @@ class DBOSTasks:
                 await self._client.cancel_workflow_async(str(task_id))
             return await self.get(task_id)
 
-    async def completed_nodes(self, task_id: UUID) -> list[NodeName]:
+    async def history(self, task_id: UUID) -> list[HistoryEntry]:
         async with self._errors():
             config: RunnableConfig = {"configurable": {"thread_id": str(task_id)}}
             async with checkpoints(self._settings) as saver:
@@ -153,7 +153,7 @@ class DBOSTasks:
                 if checkpoint is None:
                     return []
                 state = Checkpoint.model_validate(checkpoint.checkpoint["channel_values"])
-                return [entry.node for entry in state.history]
+                return state.history
 
     async def ready(self) -> None:
         async with self._errors():

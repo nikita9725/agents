@@ -51,10 +51,22 @@ def test_public_streaming(agent_client: httpx.Client) -> None:
     assert {entry.get("node") for entry in data if "node" in entry} == {
         "input",
         "planning",
-        "tools",
+        "acting",
+        "observation",
         "finalization",
     }
+    progress = [entry for entry in data if "node" in entry]
+    assert [entry["sequence"] for entry in progress] == list(range(1, len(progress) + 1))
+    assert all(entry["content"] and entry["role"] for entry in progress)
+    assert sum(entry["node"] == "acting" for entry in progress) >= 2
+    result = successful_state(agent_client, task_id)
+    assert [entry["node"] for entry in progress] == [entry.node for entry in result.history]
     assert any(entry.get("status") == "success" for entry in data), data
+    replay = agent_client.get(f"/tasks/{task_id}/events")
+    replay_data = [
+        json.loads(line[6:]) for line in replay.text.splitlines() if line.startswith("data: ")
+    ]
+    assert [entry for entry in replay_data if "node" in entry] == progress
 
 
 def runtime_info(stack: Stack, task_id: UUID, *, action: str = "inspect") -> RuntimeInfo:
@@ -182,10 +194,10 @@ def test_full_graph_reads_searches_and_calculates(agent_client: httpx.Client) ->
         ),
     )
     nodes = [entry.node for entry in state.history]
-    assert {"input", "planning", "tools", "finalization"} <= set(nodes)
+    assert {"input", "planning", "acting", "observation", "finalization"} <= set(nodes)
     assert (
-        nodes.index("tools")
-        < max(i for i, node in enumerate(nodes) if node == "planning")
+        nodes.index("observation")
+        < max(i for i, node in enumerate(nodes) if node == "acting")
         < len(nodes) - 1
     )
 

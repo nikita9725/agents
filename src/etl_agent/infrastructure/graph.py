@@ -19,7 +19,7 @@ from langgraph.runtime import Runtime
 from langgraph.types import RetryPolicy, TimeoutPolicy
 
 from etl_agent.application import Planner
-from etl_agent.domain import AgentState, HistoryEntry, NextAction, RunInput
+from etl_agent.domain import AgentState, ExecutionPlan, HistoryEntry, NextAction, RunInput
 from etl_agent.exceptions import PlanningTimeout, StepLimitExceeded, TransientPlanningError
 from etl_agent.infrastructure.tools import create_tools
 from etl_agent.observability import node_context, tool_log_payload
@@ -49,6 +49,13 @@ class InputUpdate:
 
 @dataclass(slots=True)
 class PlanningUpdate:
+    plan: ExecutionPlan
+    messages: list[AnyMessage]
+    history: list[HistoryEntry]
+
+
+@dataclass(slots=True)
+class ActingUpdate:
     messages: list[AnyMessage]
     current_step: int
     history: list[HistoryEntry]
@@ -56,8 +63,14 @@ class PlanningUpdate:
 
 @dataclass(slots=True)
 class ToolsUpdate:
+    pending_observations: list[ToolMessage]
+
+
+@dataclass(slots=True)
+class ObservationUpdate:
     messages: list[AnyMessage]
     history: list[HistoryEntry]
+    pending_observations: list[ToolMessage]
 
 
 @dataclass(slots=True)
@@ -81,33 +94,61 @@ class Nodes:
         )
 
     async def planning(self, state: AgentState, runtime: Runtime[None]) -> PlanningUpdate:
-        if state.current_step >= state.max_steps:
-            raise StepLimitExceeded("Planning step budget exhausted")
         with node_context(get_config(), runtime, state.goal):
             started = perf_counter()
             attempt = runtime.execution_info.node_attempt if runtime.execution_info else 1
             logger.info("event=node.started node=planning attempt=%s", attempt)
             try:
-                message = await self._planner.plan(state.messages)
+                plan = await self._planner.create_plan(state.goal)
             except Exception:
                 logger.exception("event=node.failed node=planning attempt=%s", attempt)
                 raise
+            text = "План:\n" + "\n".join(
+                f"{index}. {step}" for index, step in enumerate(plan.steps, 1)
+            )
             logger.info(
                 "event=node.completed node=planning attempt=%s elapsed_ms=%.1f",
                 attempt,
                 (perf_counter() - started) * 1000,
             )
             return PlanningUpdate(
+                plan=plan,
+                messages=[*state.messages, AIMessage(content=text)],
+                history=[
+                    *state.history,
+                    HistoryEntry(role="assistant", node="planning", content=text),
+                ],
+            )
+
+    async def acting(self, state: AgentState, runtime: Runtime[None]) -> ActingUpdate:
+        if state.current_step >= state.max_steps:
+            raise StepLimitExceeded("Action step budget exhausted")
+        with node_context(get_config(), runtime, state.goal):
+            started = perf_counter()
+            attempt = runtime.execution_info.node_attempt if runtime.execution_info else 1
+            logger.info("event=node.started node=acting attempt=%s", attempt)
+            try:
+                message = await self._planner.act(state.messages)
+            except Exception:
+                logger.exception("event=node.failed node=acting attempt=%s", attempt)
+                raise
+            logger.info(
+                "event=node.completed node=acting attempt=%s elapsed_ms=%.1f",
+                attempt,
+                (perf_counter() - started) * 1000,
+            )
+            parts: list[str] = [message.text] if message.text else []
+            if message.tool_calls:
+                parts.append(json.dumps(message.tool_calls, ensure_ascii=False))
+            return ActingUpdate(
                 messages=[*state.messages, message],
                 current_step=state.current_step + 1,
                 history=[
                     *state.history,
                     HistoryEntry(
                         role="assistant",
-                        node="planning",
-                        content=message.text
-                        or json.dumps(message.tool_calls, ensure_ascii=False)
-                        or "Planning completed",
+                        node="acting",
+                        content="\n".join(parts) or "Диагностика завершена",
                     ),
                 ],
             )
@@ -146,25 +187,30 @@ class Nodes:
                     tool_log_payload(result.content),
                 )
                 results.append(result)
-            return ToolsUpdate(
-                messages=[*state.messages, *results],
-                history=[
-                    *state.history,
-                    *[
-                        HistoryEntry(role="tool", node="tools", content=result.model_dump_json())
-                        for result in results
-                    ],
-                ],
-            )
+            return ToolsUpdate(pending_observations=results)
 
     @staticmethod
-    def after_planning(state: AgentState) -> Literal["tools", "finalization"]:
+    async def observation(state: AgentState) -> ObservationUpdate:
+        return ObservationUpdate(
+            messages=[*state.messages, *state.pending_observations],
+            history=[
+                *state.history,
+                *[
+                    HistoryEntry(role="tool", node="observation", content=result.model_dump_json())
+                    for result in state.pending_observations
+                ],
+            ],
+            pending_observations=[],
+        )
+
+    @staticmethod
+    def after_acting(state: AgentState) -> Literal["tools", "finalization"]:
         last = state.messages[-1]
         return "tools" if isinstance(last, AIMessage) and last.tool_calls else "finalization"
 
     @staticmethod
-    def after_tools(state: AgentState) -> Literal["planning", "finalization"]:
-        return "planning" if state.current_step < state.max_steps else "finalization"
+    def after_observation(state: AgentState) -> Literal["acting", "finalization"]:
+        return "acting" if state.current_step < state.max_steps else "finalization"
 
     async def finalization(self, state: AgentState, runtime: Runtime[None]) -> FinalizationUpdate:
         with node_context(get_config(), runtime, state.goal):
@@ -213,7 +259,14 @@ def build_graph[Version: (int, float, str)](
         retry_policy=retry_policy,
         timeout=TimeoutPolicy(run_timeout=planning_timeout),
     )
+    builder.add_node(
+        "acting",
+        nodes.acting,
+        retry_policy=retry_policy,
+        timeout=TimeoutPolicy(run_timeout=planning_timeout),
+    )
     builder.add_node("tools", nodes.tools, timeout=10)
+    builder.add_node("observation", nodes.observation, timeout=5)
     builder.add_node(
         "finalization",
         nodes.finalization,
@@ -222,7 +275,9 @@ def build_graph[Version: (int, float, str)](
     )
     builder.add_edge(START, "input")
     builder.add_edge("input", "planning")
-    builder.add_conditional_edges("planning", nodes.after_planning)
-    builder.add_conditional_edges("tools", nodes.after_tools)
+    builder.add_edge("planning", "acting")
+    builder.add_conditional_edges("acting", nodes.after_acting)
+    builder.add_edge("tools", "observation")
+    builder.add_conditional_edges("observation", nodes.after_observation)
     builder.add_edge("finalization", END)
     return builder.compile(checkpointer=checkpointer)

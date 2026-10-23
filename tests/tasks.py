@@ -39,5 +39,7 @@ def successful_state(client: httpx.Client, task_id: UUID) -> AgentState:
     assert 1 <= state.current_step <= state.max_steps
     assert state.history[0].node == "input"
     assert state.history[-1].node == "finalization"
-    assert any(entry.node == "planning" for entry in state.history)
+    assert state.plan is not None and state.plan.steps
+    assert state.pending_observations == []
+    assert sum(entry.node == "planning" for entry in state.history) == 1
     return state

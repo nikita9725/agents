@@ -2,7 +2,7 @@
 
 from typing import Annotated, Literal
 
-from langchain_core.messages import AnyMessage
+from langchain_core.messages import AnyMessage, ToolMessage
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -17,9 +17,19 @@ class NextAction(Model):
     rationale: NonEmptyText = Field(description="Brief justification based on the user's input")
 
 
+NodeName = Literal["input", "planning", "acting", "tools", "observation", "finalization"]
+
+
+class ExecutionPlan(Model):
+    steps: list[NonEmptyText] = Field(
+        min_length=1,
+        description="Ordered brief steps, each item is a plain string, never an object",
+    )
+
+
 class HistoryEntry(Model):
     role: Literal["user", "assistant", "tool"]
-    node: Literal["input", "planning", "tools", "finalization"]
+    node: NodeName
     content: NonEmptyText
 
 
@@ -29,6 +39,8 @@ class RunInput(Model):
 
 
 class AgentState(RunInput):
+    plan: ExecutionPlan | None = None
+    pending_observations: list[ToolMessage] = Field(default_factory=list)
     messages: list[AnyMessage] = Field(default_factory=list)
     history: list[HistoryEntry] = Field(default_factory=list)
     current_step: int = Field(default=0, ge=0)

@@ -50,7 +50,7 @@ async def _run_graph(task_id: str, goal: str, max_steps: int, request_id: str | 
             "configurable": {"thread_id": task_id},
             "metadata": {"task_id": task_id, "request_id": request_id},
             "run_id": UUID(task_id),
-            "recursion_limit": max(25, max_steps * 2 + 5),
+            "recursion_limit": max(25, max_steps * 3 + 5),
         }
         snapshot = await graph.aget_state(config)
         if snapshot.values and not snapshot.next:

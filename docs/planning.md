@@ -1,10 +1,18 @@
-# Планирование и инструменты — agents_day02
+# Планирование и инструменты — agents_day03
 
 Агент использует настоящий OpenAI-совместимый провайдер через LangChain.
-`Planner.plan(messages)` возвращает AIMessage с текстом или tool calls;
+`Planner.create_plan(goal)` возвращает `ExecutionPlan` с непустым списком `steps`.
+Planner видит цель и описания доступных инструментов, составляет краткий план
+(обычно 1–5 шагов) и не выполняет проверки. План сохраняется в `result.plan`
+и как текстовое сообщение в переписке для actor.
+
+`Planner.act(messages)` возвращает AIMessage с текстом или tool calls.
+Actor следует плану, учитывает observations и адаптирует действия без отдельного
+перепланирования. Зависимые вызовы должны выполняться на разных шагах.
 `Planner.finalize(messages)` возвращает FinalResponse с `final_answer` и
 `next_action` (`action`, `rationale`). Метод `propose(goal)` сохранён как
 совместимый однократный вызов первого дня; рабочий граф его не использует.
+Прежний внутренний метод `plan(messages)` переименован в `act(messages)`.
 
 Инструменты оформлены `@tool` с Pydantic `args_schema`. Каждый успешный результат
 сначала валидируется Pydantic-моделью результата и сериализуется в JSON.
@@ -95,7 +103,7 @@ uv run --locked python examples/client.py 'Найди invalid date в etl.log ч
 | read_local_file | Текст лога с `rejected_rows=30` |
 | text_search | Строка 3 с датой `2026-99-21` |
 
-Клиент печатает `task_id` и JSON результата после успешного завершения.
+Клиент печатает `task_id`, затем trace через SSE и JSON результата после завершения.
 В `messages` найдите сообщение `type=ai` с нужным `tool_calls`, затем
 `type=tool` с `status=success`. Его `tool_call_id` должен совпадать с `id`
 вызова. Поле `content` содержит observation в виде JSON-строки.
@@ -126,6 +134,20 @@ make logs
 curl -N 'http://127.0.0.1:8123/tasks/<task_id>/events'
 ```
 
-Ожидаются progress-события `input`, `planning`, `tools`, `finalization`
-и итоговый статус `success`. Сохранённые события доступны и после завершения
-задачи. Каждое имя узла выводится один раз, даже если planning/tools повторялись.
+Ожидаются записи `input`, `planning`, повторные `acting` и `observation`,
+`finalization` и итоговый статус `success`. Каждая запись содержит `sequence`,
+`node`, `role`, `content`. Сохранённые записи доступны и после завершения задачи.
+Tools сохраняет сырые результаты в checkpoint; observation публикует их в истории.
+
+Пример trace для чтения и расчёта (содержимое observations сокращено):
+
+```text
+[2] plan: План: 1. Прочитать etl.log. 2. Вычислить процент отклонений.
+[3] action: read_local_file(path=etl.log)
+[4] observation: expected_rows=120, rejected_rows=30
+[5] action: calculator(expression=30/120*100)
+[6] observation: result=25.0
+```
+
+В реальном выводе action содержит JSON tool calls, observation — JSON ToolMessage,
+включая исходный tool_call_id и status. Полный сценарий описан в [графе](graph.md).

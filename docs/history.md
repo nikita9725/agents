@@ -16,3 +16,17 @@ agents_postgres_data сохранены, автоматического пере
 ToolMessage с observations. История допускает role=tool и node=tools. У завершённых
 результатов дня 1 messages по умолчанию пуст; их чтение сохраняется. Миграция
 активных checkpoints старого графа не выполняется.
+
+## agents_day03
+
+Состояние содержит `plan.steps` и `pending_observations`. Planner формирует план один
+раз. Tools сохраняет ожидающие ToolMessage; observation переносит их в messages и
+историю и очищает pending_observations. Checkpoint после tools позволяет продолжить
+обработку observations без повторного выполнения сохранённых инструментов.
+
+История содержит planning (план), acting (решение и tool calls), observation
+(результат каждого инструмента со status и tool_call_id), finalization (ответ).
+SSE нумерует записи истории начиная с 1 и сохраняет повторные acting/observation.
+Старые результаты читаются с plan=null и pending_observations=[], прежнее имя
+узла tools остаётся допустимым. Перед обновлением завершите или отмените активные
+задачи: незавершённые checkpoints старого графа не мигрируются.

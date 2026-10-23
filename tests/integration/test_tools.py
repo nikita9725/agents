@@ -72,4 +72,9 @@ def test_real_read_then_calculate(agent_client: httpx.Client) -> None:
         and any(call["name"] == "calculator" for call in message.tool_calls)
     )
     assert read_index < calculation_index
+    assert state.plan and state.plan.steps
+    nodes = [entry.node for entry in state.history]
+    assert nodes.count("planning") == 1
+    assert nodes.count("acting") >= 2 and nodes.count("observation") >= 2
+    assert nodes.index("observation") < max(i for i, node in enumerate(nodes) if node == "acting")
     assert state.final_answer and "25" in state.final_answer
